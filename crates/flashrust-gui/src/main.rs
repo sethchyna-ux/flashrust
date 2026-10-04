@@ -8,8 +8,8 @@ use toolkit_core::{
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 720.0])
-            .with_min_inner_size([800.0, 600.0])
+            .with_inner_size([1120.0, 760.0])
+            .with_min_inner_size([880.0, 620.0])
             .with_title("Project flashrust | Hardware Flasher & Bootloader Toolkit"),
         ..Default::default()
     };
@@ -34,6 +34,7 @@ struct FlashrustApp {
     uboot_feature_override: String,
     dtb_feature_override: String,
     devices: Vec<UsbDeviceInfo>,
+    selected_device_idx: Option<usize>,
     last_device_scan: Instant,
     flashing_active: bool,
     flash_progress: f32,
@@ -43,6 +44,13 @@ struct FlashrustApp {
 impl FlashrustApp {
     fn new() -> Self {
         let default_preset = &PRESETS[0];
+        let initial_devices = list_attached_devices();
+        // Auto-select first recognized target device if available, otherwise first device
+        let initial_selected = initial_devices
+            .iter()
+            .position(|d| d.operating_mode != DeviceOperatingMode::Unknown)
+            .or_else(|| if initial_devices.is_empty() { None } else { Some(0) });
+
         Self {
             zig_version: ZigEngine::version(),
             selected_preset_idx: 0,
@@ -51,20 +59,25 @@ impl FlashrustApp {
             storage_capacity_gb: 32,
             uboot_feature_override: default_preset.uboot_feature.to_string(),
             dtb_feature_override: default_preset.dtb_feature.to_string(),
-            devices: list_attached_devices(),
+            devices: initial_devices,
+            selected_device_idx: initial_selected,
             last_device_scan: Instant::now(),
             flashing_active: false,
             flash_progress: 0.0,
             log_messages: vec![
                 "[SYSTEM] flashrust Host Orchestrator initialized".into(),
                 format!("[ENGINE] Zig Bare-Metal Engine: {}", ZigEngine::version()),
-                "[USB] nusb monitoring active".into(),
+                "[USB] nusb monitoring active - click any device to select it as flash target".into(),
             ],
         }
     }
 
     fn current_preset(&self) -> &'static BoardPreset {
         &PRESETS[self.selected_preset_idx]
+    }
+
+    fn selected_device(&self) -> Option<&UsbDeviceInfo> {
+        self.selected_device_idx.and_then(|idx| self.devices.get(idx))
     }
 
     fn compute_layout(&self) -> Option<StorageLayoutPlan> {
@@ -78,7 +91,16 @@ impl eframe::App for FlashrustApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Auto-refresh devices every 3 seconds
         if self.last_device_scan.elapsed() > Duration::from_secs(3) {
-            self.devices = list_attached_devices();
+            let updated = list_attached_devices();
+            // Preserve selection by matching VID:PID if possible
+            if let Some(current) = self.selected_device() {
+                let vid = current.vendor_id;
+                let pid = current.product_id;
+                self.selected_device_idx = updated.iter().position(|d| d.vendor_id == vid && d.product_id == pid);
+            } else if !updated.is_empty() && self.selected_device_idx.is_none() {
+                self.selected_device_idx = Some(0);
+            }
+            self.devices = updated;
             self.last_device_scan = Instant::now();
         }
 
@@ -88,8 +110,14 @@ impl eframe::App for FlashrustApp {
             if self.flash_progress >= 1.0 {
                 self.flashing_active = false;
                 self.flash_progress = 1.0;
-                self.log_messages
-                    .push("[FLASH] Image write and verification completed successfully!".into());
+                let target_name = self
+                    .selected_device()
+                    .and_then(|d| d.product.clone())
+                    .unwrap_or_else(|| "Target Device".into());
+                self.log_messages.push(format!(
+                    "[FLASH] Image write to '{}' completed successfully!",
+                    target_name
+                ));
             }
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -125,6 +153,22 @@ impl eframe::App for FlashrustApp {
         egui::TopBottomPanel::bottom("bottom_status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Attached USB Targets: {}", self.devices.len()));
+                ui.separator();
+                if let Some(target) = self.selected_device() {
+                    let prod = target.product.as_deref().unwrap_or("USB Device");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "🎯 Active Target: [{:04x}:{:04x}] {} ({:?})",
+                            target.vendor_id, target.product_id, prod, target.operating_mode
+                        ))
+                        .color(egui::Color32::from_rgb(0, 255, 180)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("⚠️ No Target Selected")
+                            .color(egui::Color32::from_rgb(255, 180, 0)),
+                    );
+                }
                 ui.separator();
                 let status_text = if self.flashing_active {
                     "Flashing in progress (512 KiB streaming chunks)..."
@@ -195,29 +239,60 @@ impl eframe::App for FlashrustApp {
 
                     ui.add_space(8.0);
 
-                    // Flash Action Button
+                    // Flash Action Button with Target Awareness
                     ui.group(|ui| {
                         ui.heading("🚀 Flash Execution");
                         ui.add_space(4.0);
 
+                        if let Some(target) = self.selected_device() {
+                            let prod = target.product.as_deref().unwrap_or("USB Device");
+                            ui.horizontal(|ui| {
+                                ui.label("Target Device:");
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "[{:04x}:{:04x}] {}",
+                                        target.vendor_id, target.product_id, prod
+                                    ))
+                                    .color(egui::Color32::from_rgb(0, 220, 255))
+                                    .strong(),
+                                );
+                            });
+                        } else {
+                            ui.label(
+                                egui::RichText::new("⚠️ Please select a USB device from the list on the right")
+                                    .color(egui::Color32::from_rgb(255, 180, 50)),
+                            );
+                        }
+
+                        let btn_enabled = !self.flashing_active && self.selected_device().is_some();
                         let btn_text = if self.flashing_active {
                             "Flashing..."
+                        } else if self.selected_device().is_some() {
+                            "Flash Selected USB Target"
                         } else {
-                            "Start Target Flash Sequence"
+                            "Select a USB Device to Flash"
                         };
 
                         if ui
-                            .add_enabled(!self.flashing_active, egui::Button::new(btn_text).min_size([200.0, 36.0].into()))
+                            .add_enabled(
+                                btn_enabled,
+                                egui::Button::new(btn_text).min_size([240.0, 36.0].into()),
+                            )
                             .clicked()
                         {
                             self.flashing_active = true;
                             self.flash_progress = 0.0;
-                            self.log_messages
-                                .push(format!("[FLASH] Staging SPL payload to SoC {}", self.current_preset().soc));
+                            if let Some(target) = self.selected_device() {
+                                let prod = target.product.as_deref().unwrap_or("USB Device");
+                                self.log_messages.push(format!(
+                                    "[FLASH] Staging SPL payload to [{:04x}:{:04x}] {} (SoC: {})",
+                                    target.vendor_id, target.product_id, prod, self.current_preset().soc
+                                ));
+                            }
                         }
 
                         if self.flashing_active || self.flash_progress > 0.0 {
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                             ui.add(
                                 egui::ProgressBar::new(self.flash_progress)
                                     .show_percentage()
@@ -242,11 +317,11 @@ impl eframe::App for FlashrustApp {
                             }
                             ui.label(format!("• Partition Table Image: {}", plan.partition_table_image));
 
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             ui.label(egui::RichText::new("Partition Map Schematic:").strong());
 
                             // Visual representation bar
-                            let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+                            let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
                             let painter = ui.painter();
 
                             // Background
@@ -279,16 +354,20 @@ impl eframe::App for FlashrustApp {
 
                     ui.add_space(8.0);
 
-                    // USB Device Topology
+                    // USB Device Topology with Interactive Selection
                     ui.group(|ui| {
-                        ui.heading("🔌 Attached USB Topology");
+                        ui.horizontal(|ui| {
+                            ui.heading("🔌 Attached USB Devices");
+                            ui.label(egui::RichText::new("(Click to select target)").italics().color(egui::Color32::GRAY));
+                        });
                         ui.add_space(4.0);
 
                         if self.devices.is_empty() {
                             ui.label(egui::RichText::new("No flashing targets or debug probes connected").color(egui::Color32::GRAY));
                         } else {
                             egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                                for dev in &self.devices {
+                                for (idx, dev) in self.devices.iter().enumerate() {
+                                    let is_selected = self.selected_device_idx == Some(idx);
                                     let mode_color = match dev.operating_mode {
                                         DeviceOperatingMode::NxpSerialDownload => egui::Color32::from_rgb(255, 165, 0),
                                         DeviceOperatingMode::Fastboot => egui::Color32::from_rgb(0, 255, 128),
@@ -299,12 +378,42 @@ impl eframe::App for FlashrustApp {
 
                                     let prod = dev.product.as_deref().unwrap_or("Generic USB Device");
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("[{:04x}:{:04x}]", dev.vendor_id, dev.product_id));
-                                        ui.label(prod);
+                                        let prefix = if is_selected { "▶" } else { " " };
+                                        let label = format!("{} [{:04x}:{:04x}] {}", prefix, dev.vendor_id, dev.product_id, prod);
+                                        if ui.selectable_label(is_selected, label).clicked() {
+                                            self.selected_device_idx = Some(idx);
+                                            self.log_messages.push(format!(
+                                                "[USB] Selected target device: [{:04x}:{:04x}] {}",
+                                                dev.vendor_id, dev.product_id, prod
+                                            ));
+                                        }
                                         ui.colored_label(mode_color, format!("({:?})", dev.operating_mode));
                                     });
                                 }
                             });
+
+                            // Display inspector panel for the selected device
+                            if let Some(target) = self.selected_device() {
+                                ui.add_space(4.0);
+                                egui::Frame::NONE
+                                    .fill(egui::Color32::from_rgb(24, 30, 36))
+                                    .corner_radius(4.0)
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Selected Target:").strong().color(egui::Color32::from_rgb(0, 210, 255)));
+                                            ui.label(format!("{:04x}:{:04x}", target.vendor_id, target.product_id));
+                                            ui.separator();
+                                            ui.label(format!("Mode: {:?}", target.operating_mode));
+                                        });
+                                        if let Some(ref mfg) = target.manufacturer {
+                                            ui.label(format!("Manufacturer: {}", mfg));
+                                        }
+                                        if let Some(ref sn) = target.serial_number {
+                                            ui.label(format!("Serial Number: {}", sn));
+                                        }
+                                    });
+                            }
                         }
                     });
 
@@ -315,7 +424,7 @@ impl eframe::App for FlashrustApp {
                         ui.heading("📋 Target RTT & Event Log");
                         ui.add_space(4.0);
 
-                        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
                             for msg in self.log_messages.iter().rev() {
                                 ui.label(egui::RichText::new(msg).monospace().color(egui::Color32::from_rgb(220, 220, 140)));
                             }

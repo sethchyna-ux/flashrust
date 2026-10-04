@@ -13,7 +13,7 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
-use toolkit_core::{list_attached_devices, PRESETS, ZigEngine, UsbDeviceInfo};
+use toolkit_core::{list_attached_devices, PRESETS, UsbDeviceInfo, ZigEngine};
 
 pub struct TerminalGuard {
     stdout: Stdout,
@@ -50,12 +50,13 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let zig_version = ZigEngine::version();
     let mut last_usb_scan = Instant::now();
     let mut cached_devices: Vec<UsbDeviceInfo> = list_attached_devices();
+    let mut selected_device_idx: usize = 0;
 
     // RTT trace log buffer
     let mut rtt_logs: Vec<String> = vec![
         "[BOOT] RP2350 ROM execution started: magic 0xffffded3 verified".into(),
         "[DCP] Co-Processor 4 (DCP) double precision initialized".into(),
-        "[USB] nusb endpoint watcher active (polling IOKit/usbfs)".into(),
+        "[USB] nusb endpoint watcher active (use ↑/↓ to select target)".into(),
     ];
 
     // Simulated flashing state for Gauge demonstration
@@ -68,6 +69,9 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         if last_usb_scan.elapsed() >= Duration::from_millis(2500) {
             cached_devices = list_attached_devices();
             last_usb_scan = Instant::now();
+            if selected_device_idx >= cached_devices.len() && !cached_devices.is_empty() {
+                selected_device_idx = cached_devices.len() - 1;
+            }
         }
 
         // Advance simulation progress if active
@@ -75,7 +79,11 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             flash_progress = (flash_progress + 2).min(100);
             if flash_progress >= 100 {
                 flash_sim_active = false;
-                rtt_logs.push("[FLASH] Flashing completed successfully. Target rebooting.".into());
+                let target_info = cached_devices
+                    .get(selected_device_idx)
+                    .and_then(|d| d.product.clone())
+                    .unwrap_or_else(|| "Target Device".into());
+                rtt_logs.push(format!("[FLASH] Flashing to '{}' completed. Target rebooting.", target_info));
             }
         }
 
@@ -109,12 +117,16 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             f.render_widget(header, chunks[0]);
 
             // 2. Flashing Progress Bar (Gauge)
+            let selected_dev_desc = cached_devices.get(selected_device_idx).map(|d| {
+                format!("[{:04x}:{:04x}] {}", d.vendor_id, d.product_id, d.product.as_deref().unwrap_or("USB Target"))
+            }).unwrap_or_else(|| "No Target Selected".into());
+
             let gauge_title = if flash_sim_active {
-                format!(" Streaming Chunks over nusb (Speed: {:.1} MiB/s) ", flash_speed_mib)
+                format!(" Streaming Chunks to {} (Speed: {:.1} MiB/s) ", selected_dev_desc, flash_speed_mib)
             } else if flash_progress == 100 {
-                " Flashing Complete (100%) ".to_string()
+                format!(" Flashing Complete to {} (100%) ", selected_dev_desc)
             } else {
-                " Flashing Engine Idle - Press [f] to trigger test flash stream ".to_string()
+                format!(" Target: {} | Press [f] to flash selected device ", selected_dev_desc)
             };
 
             let gauge = Gauge::default()
@@ -127,9 +139,9 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             let main_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(40), // Presets
-                    Constraint::Percentage(30), // USB
-                    Constraint::Percentage(30), // RTT Logs
+                    Constraint::Percentage(38), // Presets
+                    Constraint::Percentage(34), // USB
+                    Constraint::Percentage(28), // RTT Logs
                 ])
                 .split(chunks[2]);
 
@@ -162,11 +174,11 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             .block(Block::default().borders(Borders::ALL).title(" Hardware Profiles "));
             f.render_widget(table, main_chunks[0]);
 
-            // USB Topology Panel
-            let mut device_lines = vec![Line::from(Span::styled(
-                format!("Attached Devices: {}", cached_devices.len()),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ))];
+            // USB Topology Panel with Selection Cursor
+            let mut device_lines = vec![Line::from(vec![
+                Span::styled(format!("Attached Devices: {} ", cached_devices.len()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled("(↑/↓ navigate)", Style::default().fg(Color::DarkGray)),
+            ])];
 
             if cached_devices.is_empty() {
                 device_lines.push(Line::from(Span::styled(
@@ -174,21 +186,29 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
-                for dev in cached_devices.iter().take(6) {
+                for (idx, dev) in cached_devices.iter().enumerate().take(7) {
+                    let is_sel = idx == selected_device_idx;
                     let mode_str = format!("{:?}", dev.operating_mode);
+                    let prefix = if is_sel { "▶ " } else { "  " };
                     let desc = format!(
-                        "• [{:04x}:{:04x}] {} ({})",
+                        "{}[{:04x}:{:04x}] {} ({})",
+                        prefix,
                         dev.vendor_id,
                         dev.product_id,
                         dev.product.as_deref().unwrap_or("USB Device"),
                         mode_str
                     );
-                    device_lines.push(Line::from(Span::styled(desc, Style::default().fg(Color::White))));
+                    let style = if is_sel {
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    device_lines.push(Line::from(Span::styled(desc, style)));
                 }
             }
 
             let usb_panel = Paragraph::new(device_lines)
-                .block(Block::default().borders(Borders::ALL).title(" USB Hotplug Topology "));
+                .block(Block::default().borders(Borders::ALL).title(" USB Target Selection "));
             f.render_widget(usb_panel, main_chunks[1]);
 
             // RTT Terminal Log Viewer
@@ -214,12 +234,14 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
             // 4. Footer
             let footer = Paragraph::new(Line::from(vec![
+                Span::styled(" [↑/↓] ", Style::default().fg(Color::Black).bg(Color::White)),
+                Span::raw(" Select Target   "),
+                Span::styled(" [f] ", Style::default().fg(Color::Black).bg(Color::White)),
+                Span::raw(" Flash Target   "),
+                Span::styled(" [r] ", Style::default().fg(Color::Black).bg(Color::White)),
+                Span::raw(" Rescan USB   "),
                 Span::styled(" [q] ", Style::default().fg(Color::Black).bg(Color::White)),
                 Span::raw(" Quit   "),
-                Span::styled(" [r] ", Style::default().fg(Color::Black).bg(Color::White)),
-                Span::raw(" Force Rescan   "),
-                Span::styled(" [f] ", Style::default().fg(Color::Black).bg(Color::White)),
-                Span::raw(" Test Flash Stream   "),
             ]))
             .block(Block::default().borders(Borders::ALL));
             f.render_widget(footer, chunks[3]);
@@ -231,15 +253,36 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if selected_device_idx > 0 {
+                                selected_device_idx -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !cached_devices.is_empty() && selected_device_idx + 1 < cached_devices.len() {
+                                selected_device_idx += 1;
+                            }
+                        }
                         KeyCode::Char('r') => {
                             cached_devices = list_attached_devices();
                             last_usb_scan = Instant::now();
-                            rtt_logs.push(format!("[USB] Manual rescan complete: {} devices found", cached_devices.len()));
+                            if selected_device_idx >= cached_devices.len() && !cached_devices.is_empty() {
+                                selected_device_idx = cached_devices.len() - 1;
+                            }
+                            rtt_logs.push(format!("[USB] Rescan complete: {} devices found", cached_devices.len()));
                         }
                         KeyCode::Char('f') => {
-                            flash_sim_active = true;
-                            flash_progress = 0;
-                            rtt_logs.push("[FLASH] Initiating chunked streaming over nusb (512 KiB blocks)...".into());
+                            if let Some(target) = cached_devices.get(selected_device_idx) {
+                                flash_sim_active = true;
+                                flash_progress = 0;
+                                let prod = target.product.as_deref().unwrap_or("USB Device");
+                                rtt_logs.push(format!(
+                                    "[FLASH] Selected target [{:04x}:{:04x}] {} for streaming...",
+                                    target.vendor_id, target.product_id, prod
+                                ));
+                            } else {
+                                rtt_logs.push("[ERROR] No USB device selected for flashing".into());
+                            }
                         }
                         _ => {}
                     }
