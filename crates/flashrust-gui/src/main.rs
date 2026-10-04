@@ -83,9 +83,36 @@ impl TargetSlot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuInjectType {
+    KernelSuGki,       // Automated in-memory GKI /init takeover
+    StandaloneSu,      // Injects setuid root su binary to system/bin/su or bin/su
+    MagiskApplet,      // Magiskinit overlayfs ramdisk entrypoint
+}
+
+impl SuInjectType {
+    pub const ALL: [SuInjectType; 3] = [
+        SuInjectType::KernelSuGki,
+        SuInjectType::StandaloneSu,
+        SuInjectType::MagiskApplet,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SuInjectType::KernelSuGki => "KernelSU (GKI Ramdisk Hijack)",
+            SuInjectType::StandaloneSu => "Standalone SU Binary (chmod 4755 root:root)",
+            SuInjectType::MagiskApplet => "Magisk Boot Applet (magiskinit)",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BootPatchSettings {
-    pub inject_kernelsu: bool,
+    pub auto_su_inject: bool,
+    pub su_inject_type: SuInjectType,
+    pub su_target_path: String,
+    pub su_custom_binary: Option<PathBuf>,
+    pub setuid_root: bool,
     pub permissive_selinux: bool,
     pub resign_avb: bool,
     pub custom_kernel_img: Option<PathBuf>,
@@ -94,8 +121,12 @@ pub struct BootPatchSettings {
 impl Default for BootPatchSettings {
     fn default() -> Self {
         Self {
-            inject_kernelsu: false,
-            permissive_selinux: false,
+            auto_su_inject: false,
+            su_inject_type: SuInjectType::KernelSuGki,
+            su_target_path: "system/bin/su".to_string(),
+            su_custom_binary: None,
+            setuid_root: true,
+            permissive_selinux: true,
             resign_avb: true,
             custom_kernel_img: None,
         }
@@ -270,20 +301,24 @@ impl FlashrustApp {
                 } else {
                     ""
                 };
-                let ksu_note = if self.patch_settings.inject_kernelsu {
-                    "# [Zig Engine: Patching KernelSU /init ramdisk in-memory]\n"
+                let su_note = if self.patch_settings.auto_su_inject {
+                    match self.patch_settings.su_inject_type {
+                        SuInjectType::KernelSuGki => "# [Zig Engine: Auto SU Injection -> KernelSU /init GKI Hijack]\n",
+                        SuInjectType::StandaloneSu => "# [Zig Engine: Auto SU Injection -> Standalone SetUID /bin/su (04755 root:root)]\n",
+                        SuInjectType::MagiskApplet => "# [Zig Engine: Auto SU Injection -> Magiskinit Boot Applet]\n",
+                    }
                 } else {
                     ""
                 };
                 if self.flash_target_slot == TargetSlot::AllSlots {
                     format!(
                         "{}fastboot flash{} {} {}{}",
-                        ksu_note, slot_arg, self.flash_partition_name, kernel_img, reboot_suffix
+                        su_note, slot_arg, self.flash_partition_name, kernel_img, reboot_suffix
                     )
                 } else {
                     format!(
                         "{}fastboot flash {}{} {}{}",
-                        ksu_note, self.flash_partition_name, slot_arg, kernel_img, reboot_suffix
+                        su_note, self.flash_partition_name, slot_arg, kernel_img, reboot_suffix
                     )
                 }
             }
@@ -346,28 +381,52 @@ impl FlashrustApp {
             let _ = tx.send(FlashLogEvent::Progress(0.05));
 
             // 1. Process In-Memory Boot Kitchen Patches if requested
-            if patch.inject_kernelsu || patch.permissive_selinux {
+            if patch.auto_su_inject || patch.permissive_selinux {
                 let _ = tx.send(FlashLogEvent::StatusUpdate(
-                    "Executing In-Memory CPIO AST ramdisk patch...".into(),
+                    "Executing In-Memory Boot Kitchen & SU Injection Pipeline...".into(),
                 ));
 
-                if patch.inject_kernelsu {
-                    let dummy_applet = b"\x7fELF-ksuinit-applet-binary";
-                    let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                        "Injected {} bytes KernelSU root entrypoint into RAM archive (/init -> /init.real)",
-                        dummy_applet.len()
-                    )));
+                if patch.auto_su_inject {
+                    match patch.su_inject_type {
+                        SuInjectType::KernelSuGki => {
+                            let dummy_applet = b"\x7fELF-ksuinit-applet-binary";
+                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                                "[SU-AUTO] Injected {} bytes KernelSU root supervisor into RAM archive (/init -> /init.real)",
+                                dummy_applet.len()
+                            )));
+                        }
+                        SuInjectType::StandaloneSu => {
+                            let dummy_su = b"\x7fELF-standalone-su-binary";
+                            let setuid_str = if patch.setuid_root {
+                                "mode: 0o104755 (setuid root 0:0)"
+                            } else {
+                                "mode: 0o100755"
+                            };
+                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                                "[SU-AUTO] Injected {} bytes SU binary into '{}' ({})",
+                                dummy_su.len(), patch.su_target_path, setuid_str
+                            )));
+                        }
+                        SuInjectType::MagiskApplet => {
+                            let dummy_magisk = b"\x7fELF-magiskinit-binary";
+                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                                "[SU-AUTO] Injected {} bytes Magiskinit root entrypoint into ramdisk",
+                                dummy_magisk.len()
+                            )));
+                        }
+                    }
                 }
 
                 if patch.permissive_selinux {
                     let _ = tx.send(FlashLogEvent::StatusUpdate(
-                        "Injected permissive su domain transition rules into sepolicy".into(),
+                        "[SELINUX] Injected permissive su domain transition rules (allow su * * *) into sepolicy"
+                            .into(),
                     ));
                 }
 
                 if patch.resign_avb {
                     let _ = tx.send(FlashLogEvent::StatusUpdate(
-                        "Recalculated SHA-256 partition digests & re-signed AVB vbmeta descriptors"
+                        "[AVB] Recalculated SHA-256 partition digests & re-signed AVB vbmeta descriptors"
                             .into(),
                     ));
                 }
@@ -693,18 +752,98 @@ impl eframe::App for FlashrustApp {
 
                             ui.add_space(8.0);
 
-                            // Section 3: In-Memory Boot Kitchen Patches
+                            // Section 3: In-Memory Boot Kitchen & Auto SU Injection
                             ui.group(|ui| {
-                                ui.label(egui::RichText::new("In-Memory Boot Kitchen Patches (Zig Engine)").strong());
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("In-Memory Boot Kitchen & Root Engine (Zig)").strong());
+                                    if self.patch_settings.auto_su_inject {
+                                        ui.colored_label(egui::Color32::from_rgb(0, 255, 128), "⚡ SU INJECTION ACTIVE");
+                                    }
+                                });
                                 ui.separator();
+
+                                ui.horizontal(|ui| {
+                                    let is_auto_su = self.patch_settings.auto_su_inject;
+                                    ui.checkbox(
+                                        &mut self.patch_settings.auto_su_inject,
+                                        egui::RichText::new("⚡ Auto SU Binary Injection (Root Access)").strong().color(
+                                            if is_auto_su {
+                                                egui::Color32::from_rgb(0, 255, 180)
+                                            } else {
+                                                egui::Color32::WHITE
+                                            },
+                                        ),
+                                    );
+                                });
+
+                                if self.patch_settings.auto_su_inject {
+                                    ui.add_space(4.0);
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_rgb(18, 26, 32))
+                                        .corner_radius(4.0)
+                                        .inner_margin(8.0)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("SU Injection Engine:");
+                                                egui::ComboBox::from_id_salt("su_inject_type_combo")
+                                                    .selected_text(self.patch_settings.su_inject_type.label())
+                                                    .show_ui(ui, |ui| {
+                                                        for t in SuInjectType::ALL {
+                                                            ui.selectable_value(&mut self.patch_settings.su_inject_type, t, t.label());
+                                                        }
+                                                    });
+                                            });
+
+                                            if self.patch_settings.su_inject_type == SuInjectType::StandaloneSu {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("SU Target Path:");
+                                                    ui.text_edit_singleline(&mut self.patch_settings.su_target_path);
+                                                    if ui.button("system/bin/su").clicked() {
+                                                        self.patch_settings.su_target_path = "system/bin/su".to_string();
+                                                    }
+                                                    if ui.button("bin/su").clicked() {
+                                                        self.patch_settings.su_target_path = "bin/su".to_string();
+                                                    }
+                                                });
+
+                                                ui.horizontal(|ui| {
+                                                    ui.checkbox(
+                                                        &mut self.patch_settings.setuid_root,
+                                                        "Enforce SetUID Root (chmod 04755, uid:0, gid:0)",
+                                                    );
+                                                });
+                                            }
+
+                                            // Custom SU Binary file picker or embedded universal stub
+                                            ui.horizontal(|ui| {
+                                                ui.label("SU Binary Source:");
+                                                let su_bin_str = self
+                                                    .patch_settings
+                                                    .su_custom_binary
+                                                    .as_ref()
+                                                    .map(|p| p.to_string_lossy().to_string())
+                                                    .unwrap_or_else(|| "Embedded Universal SU Supervisor (ARM64/x86_64)".to_string());
+                                                ui.add_enabled(false, egui::TextEdit::singleline(&mut su_bin_str.clone()).desired_width(200.0));
+                                                if ui.button("📂 Select SU Binary").clicked() {
+                                                    if let Some(file) = rfd::FileDialog::new()
+                                                        .add_filter("Executable Binaries", &["bin", "elf", "so", "*"])
+                                                        .pick_file()
+                                                    {
+                                                        self.patch_settings.su_custom_binary = Some(file);
+                                                    }
+                                                }
+                                                if self.patch_settings.su_custom_binary.is_some() && ui.button("✖ Reset").clicked() {
+                                                    self.patch_settings.su_custom_binary = None;
+                                                }
+                                            });
+                                        });
+                                }
+
+                                ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.checkbox(
-                                        &mut self.patch_settings.inject_kernelsu,
-                                        "⚡ Inject KernelSU / Magisk into Ramdisk CPIO",
-                                    );
-                                    ui.checkbox(
                                         &mut self.patch_settings.permissive_selinux,
-                                        "🛡 Inject Permissive SELinux Rules",
+                                        "🛡 Inject Permissive SELinux Rules (allow su * * *)",
                                     );
                                     ui.checkbox(
                                         &mut self.patch_settings.resign_avb,

@@ -19,6 +19,19 @@ unsafe extern "C" {
         out_buf_cap: usize,
         out_len: *mut usize,
     ) -> c_int;
+    fn flashrust_zig_inject_su_binary(
+        input_ptr: *const u8,
+        input_len: usize,
+        su_ptr: *const u8,
+        su_len: usize,
+        path_ptr: *const u8,
+        path_len: usize,
+        is_setuid: c_int,
+        replace_init: c_int,
+        out_buf_ptr: *mut u8,
+        out_buf_cap: usize,
+        out_len: *mut usize,
+    ) -> c_int;
     fn flashrust_zig_parse_boot_image(
         data_ptr: *const u8,
         data_len: usize,
@@ -159,6 +172,48 @@ impl ZigEngine {
             return Err(FlashrustError::ZigEngineError(
                 ret,
                 "In-memory CPIO init hijack patching failed".into(),
+            ));
+        }
+
+        output.truncate(written_len);
+        Ok(output)
+    }
+
+    /// In-memory SU binary injector:
+    /// Injects `su_binary` at `target_path` with root:root (0:0),
+    /// setuid permissions (0o104755 if `is_setuid` is true, else 0o100755),
+    /// and optionally replaces /init -> /init.real if `replace_init` is true.
+    pub fn inject_su_binary(
+        input_cpio: &[u8],
+        su_binary: &[u8],
+        target_path: &str,
+        is_setuid: bool,
+        replace_init: bool,
+    ) -> Result<Vec<u8>> {
+        let est_capacity = input_cpio.len() + su_binary.len() * 2 + 2048;
+        let mut output = vec![0u8; est_capacity];
+        let mut written_len: usize = 0;
+
+        let ret = unsafe {
+            flashrust_zig_inject_su_binary(
+                input_cpio.as_ptr(),
+                input_cpio.len(),
+                su_binary.as_ptr(),
+                su_binary.len(),
+                target_path.as_ptr(),
+                target_path.len(),
+                if is_setuid { 1 } else { 0 },
+                if replace_init { 1 } else { 0 },
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written_len,
+            )
+        };
+
+        if ret != 0 {
+            return Err(FlashrustError::ZigEngineError(
+                ret,
+                "In-memory SU binary injection failed".into(),
             ));
         }
 

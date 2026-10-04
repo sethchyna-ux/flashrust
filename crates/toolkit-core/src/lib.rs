@@ -203,4 +203,26 @@ mod tests {
         assert!(policy_str.contains("allow su * * *"));
         assert!(policy_str.contains("mock-selinux-binary-policy-content"));
     }
+
+    #[test]
+    fn test_in_memory_su_binary_injection() {
+        let original_cpio = create_synthetic_cpio();
+        let su_bytes = b"\x7fELF-standalone-su-binary";
+
+        // Inject at system/bin/su with setuid true and replace_init true
+        let patched_cpio = ZigEngine::inject_su_binary(
+            &original_cpio,
+            su_bytes,
+            "system/bin/su",
+            true,
+            true,
+        )
+        .expect("SU binary injection should succeed");
+
+        let patched_str = String::from_utf8_lossy(&patched_cpio);
+        assert!(patched_str.contains("system/bin/su"), "Should contain system/bin/su");
+        assert!(patched_str.contains("init.real"), "Should contain renamed init.real");
+        assert!(patched_str.contains("init"), "Should contain new init entry");
+        assert!(patched_cpio.windows(su_bytes.len()).any(|w| w == su_bytes));
+    }
 }

@@ -55,6 +55,49 @@ export fn flashrust_zig_patch_cpio_init(
     return 0;
 }
 
+export fn flashrust_zig_inject_su_binary(
+    input_ptr: ?[*]const u8,
+    input_len: usize,
+    su_ptr: ?[*]const u8,
+    su_len: usize,
+    path_ptr: ?[*]const u8,
+    path_len: usize,
+    is_setuid: c_int,
+    replace_init: c_int,
+    out_buf_ptr: ?[*]u8,
+    out_buf_cap: usize,
+    out_len: *usize,
+) c_int {
+    const in_slice = (input_ptr orelse return -1)[0..input_len];
+    const su_slice = (su_ptr orelse return -1)[0..su_len];
+    const path_slice = (path_ptr orelse return -1)[0..path_len];
+    const out_slice = (out_buf_ptr orelse return -1)[0..out_buf_cap];
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const written = cpio.injectSuBinary(
+        allocator,
+        in_slice,
+        su_slice,
+        path_slice,
+        is_setuid != 0,
+        replace_init != 0,
+        out_slice,
+    ) catch |err| switch (err) {
+        error.BufferTooShort => return -2,
+        error.InvalidMagic => return -3,
+        error.InvalidHexField => return -4,
+        error.BufferOverflow => return -5,
+        error.InitNotFound => return -6,
+        error.OutOfMemory => return -7,
+    };
+
+    out_len.* = written;
+    return 0;
+}
+
 export fn flashrust_zig_parse_boot_image(
     data_ptr: ?[*]const u8,
     data_len: usize,

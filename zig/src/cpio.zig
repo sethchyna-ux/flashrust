@@ -241,3 +241,149 @@ pub fn patchInitHijack(
 
     return cursor;
 }
+
+/// Injects an SU binary into the CPIO archive:
+/// - Places binary at `target_path` (e.g. "system/bin/su" or "bin/su")
+/// - Enforces root:root (uid: 0, gid: 0)
+/// - Sets mode: 0o104755 (setuid) if `is_setuid` is true, otherwise 0o100755
+/// - If `replace_init` is true, renames "/init" -> "/init.real" and installs su_binary as the new "/init"
+pub fn injectSuBinary(
+    allocator: std.mem.Allocator,
+    input_cpio: []const u8,
+    su_binary: []const u8,
+    target_path: []const u8,
+    is_setuid: bool,
+    replace_init: bool,
+    output_buf: []u8,
+) CpioError!usize {
+    var entries: std.ArrayListUnmanaged(CpioEntry) = .empty;
+    defer entries.deinit(allocator);
+
+    var offset: usize = 0;
+
+    while (offset + HEADER_LEN <= input_cpio.len) {
+        const header = parseNewcHeader(input_cpio[offset..]) catch break;
+        const name_start = offset + HEADER_LEN;
+        const name_end = name_start + header.namesize;
+        if (name_end > input_cpio.len) break;
+
+        const raw_name = input_cpio[name_start..name_end];
+        const clean_name = if (raw_name.len > 0 and raw_name[raw_name.len - 1] == 0)
+            raw_name[0 .. raw_name.len - 1]
+        else
+            raw_name;
+
+        const data_start = offset + align4(HEADER_LEN + header.namesize);
+        const data_end = data_start + @as(usize, @intCast(header.filesize));
+        if (data_end > input_cpio.len) break;
+
+        const entry_data = input_cpio[data_start..data_end];
+
+        if (replace_init and (std.mem.eql(u8, clean_name, "init") or std.mem.eql(u8, clean_name, "/init"))) {
+            var mod_header = header;
+            const new_name = "init.real";
+            mod_header.namesize = @as(u32, @intCast(new_name.len + 1));
+            mod_header.uid = 0;
+            mod_header.gid = 0;
+            mod_header.mode = 0o100755;
+
+            entries.append(allocator, .{
+                .header = mod_header,
+                .name = new_name,
+                .data = entry_data,
+            }) catch return error.OutOfMemory;
+        } else {
+            entries.append(allocator, .{
+                .header = header,
+                .name = clean_name,
+                .data = entry_data,
+            }) catch return error.OutOfMemory;
+        }
+
+        if (std.mem.eql(u8, clean_name, TRAILER_NAME)) {
+            break;
+        }
+
+        offset = data_start + align4(@as(usize, @intCast(header.filesize)));
+    }
+
+    var trailer_idx: usize = entries.items.len;
+    for (entries.items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item.name, TRAILER_NAME)) {
+            trailer_idx = idx;
+            break;
+        }
+    }
+
+    // 1. If replace_init, inject "init" entry
+    if (replace_init) {
+        const injected_init = CpioEntry{
+            .header = NewcHeader{
+                .ino = 100,
+                .mode = 0o100755,
+                .uid = 0,
+                .gid = 0,
+                .nlink = 1,
+                .mtime = 0,
+                .filesize = su_binary.len,
+                .namesize = 5,
+                .check = 0,
+            },
+            .name = "init",
+            .data = su_binary,
+        };
+        entries.insert(allocator, trailer_idx, injected_init) catch return error.OutOfMemory;
+        trailer_idx += 1;
+    }
+
+    // 2. Inject target_path entry (e.g. "system/bin/su" or "bin/su")
+    const su_mode: u32 = if (is_setuid) 0o104755 else 0o100755;
+    const injected_su = CpioEntry{
+        .header = NewcHeader{
+            .ino = 101,
+            .mode = su_mode,
+            .uid = 0,
+            .gid = 0,
+            .nlink = 1,
+            .mtime = 0,
+            .filesize = su_binary.len,
+            .namesize = @as(u32, @intCast(target_path.len + 1)),
+            .check = 0,
+        },
+        .name = target_path,
+        .data = su_binary,
+    };
+    entries.insert(allocator, trailer_idx, injected_su) catch return error.OutOfMemory;
+
+    // Serialize entries
+    var cursor: usize = 0;
+    for (entries.items) |e| {
+        if (cursor + HEADER_LEN > output_buf.len) return error.BufferOverflow;
+        var header_bytes: [HEADER_LEN]u8 = undefined;
+        formatNewcHeader(&header_bytes, e.header);
+        @memcpy(output_buf[cursor .. cursor + HEADER_LEN], &header_bytes);
+        cursor += HEADER_LEN;
+
+        if (cursor + e.name.len + 1 > output_buf.len) return error.BufferOverflow;
+        @memcpy(output_buf[cursor .. cursor + e.name.len], e.name);
+        cursor += e.name.len;
+        output_buf[cursor] = 0;
+        cursor += 1;
+
+        const name_pad = align4(HEADER_LEN + e.header.namesize) - (HEADER_LEN + e.header.namesize);
+        if (cursor + name_pad > output_buf.len) return error.BufferOverflow;
+        @memset(output_buf[cursor .. cursor + name_pad], 0);
+        cursor += name_pad;
+
+        if (cursor + e.data.len > output_buf.len) return error.BufferOverflow;
+        @memcpy(output_buf[cursor .. cursor + e.data.len], e.data);
+        cursor += e.data.len;
+
+        const data_pad = align4(e.data.len) - e.data.len;
+        if (cursor + data_pad > output_buf.len) return error.BufferOverflow;
+        @memset(output_buf[cursor .. cursor + data_pad], 0);
+        cursor += data_pad;
+    }
+
+    return cursor;
+}
