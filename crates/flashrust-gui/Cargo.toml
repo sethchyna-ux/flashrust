@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 toolkit-core = { path = "../toolkit-core" }
 eframe = "0.31"
+rfd = "0.17.2"

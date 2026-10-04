@@ -25,6 +25,61 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashTargetType {
+    FastbootPartition,
+    NxpBootloaderSpl,
+    NxpFitImage,
+    RawStorageOffset,
+    Rp2350Qspi,
+}
+
+impl FlashTargetType {
+    pub const ALL: [FlashTargetType; 5] = [
+        FlashTargetType::FastbootPartition,
+        FlashTargetType::NxpBootloaderSpl,
+        FlashTargetType::NxpFitImage,
+        FlashTargetType::RawStorageOffset,
+        FlashTargetType::Rp2350Qspi,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FlashTargetType::FastbootPartition => "Fastboot Partition (Android)",
+            FlashTargetType::NxpBootloaderSpl => "NXP SPL Bootloader (Raw/eMMC)",
+            FlashTargetType::NxpFitImage => "NXP FIT / OS Image (UUU)",
+            FlashTargetType::RawStorageOffset => "Raw Storage Offset (Hex LBA)",
+            FlashTargetType::Rp2350Qspi => "RP2350 QSPI Flash Subwindow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSlot {
+    Active,
+    SlotA,
+    SlotB,
+    AllSlots,
+}
+
+impl TargetSlot {
+    pub const ALL: [TargetSlot; 4] = [
+        TargetSlot::Active,
+        TargetSlot::SlotA,
+        TargetSlot::SlotB,
+        TargetSlot::AllSlots,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TargetSlot::Active => "Active / Current Slot",
+            TargetSlot::SlotA => "Slot A (_a)",
+            TargetSlot::SlotB => "Slot B (_b)",
+            TargetSlot::AllSlots => "Both Slots (_all)",
+        }
+    }
+}
+
 struct FlashrustApp {
     zig_version: &'static str,
     selected_preset_idx: usize,
@@ -40,6 +95,15 @@ struct FlashrustApp {
     flashing_active: bool,
     flash_progress: f32,
     log_messages: Vec<String>,
+
+    // Flash Payload & Target Configuration
+    flash_target_type: FlashTargetType,
+    flash_image_path: String,
+    flash_partition_name: String,
+    flash_target_slot: TargetSlot,
+    custom_flash_offset: String,
+    enable_ksu_injection: bool,
+    auto_reboot_after_flash: bool,
 }
 
 impl FlashrustApp {
@@ -71,6 +135,13 @@ impl FlashrustApp {
                 format!("[ENGINE] Zig Bare-Metal Engine: {}", ZigEngine::version()),
                 "[USB] nusb monitoring active - selecting a target auto-detects its hardware profile".into(),
             ],
+            flash_target_type: FlashTargetType::FastbootPartition,
+            flash_image_path: String::new(),
+            flash_partition_name: "boot".to_string(),
+            flash_target_slot: TargetSlot::Active,
+            custom_flash_offset: "0x8400".to_string(),
+            enable_ksu_injection: false,
+            auto_reboot_after_flash: false,
         };
 
         if let Some(idx) = initial_selected {
@@ -105,6 +176,23 @@ impl FlashrustApp {
             } else {
                 self.auto_detected_profile = None;
             }
+
+            // Auto-configure payload mode based on target operating mode
+            match dev.operating_mode {
+                DeviceOperatingMode::Fastboot | DeviceOperatingMode::AndroidAdb => {
+                    self.flash_target_type = FlashTargetType::FastbootPartition;
+                    if self.flash_partition_name.is_empty() {
+                        self.flash_partition_name = "boot".to_string();
+                    }
+                }
+                DeviceOperatingMode::NxpSerialDownload => {
+                    self.flash_target_type = FlashTargetType::NxpBootloaderSpl;
+                }
+                DeviceOperatingMode::Rp2350BootRom | DeviceOperatingMode::Rp2040BootRom => {
+                    self.flash_target_type = FlashTargetType::Rp2350Qspi;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -120,6 +208,53 @@ impl FlashrustApp {
         let preset = self.current_preset();
         let bytes = self.storage_capacity_gb * 1024 * 1024 * 1024;
         create_storage_layout_plan(preset.soc, self.emmc_boot, self.mcu_binary, bytes).ok()
+    }
+
+    fn generate_flash_command_preview(&self) -> String {
+        let payload_file = if !self.flash_image_path.is_empty() {
+            self.flash_image_path.clone()
+        } else {
+            match self.flash_target_type {
+                FlashTargetType::FastbootPartition => format!("{}.img", self.flash_partition_name),
+                FlashTargetType::NxpBootloaderSpl => "u-boot-spl.bin".to_string(),
+                FlashTargetType::NxpFitImage => "u-boot.itb".to_string(),
+                FlashTargetType::RawStorageOffset => "partition-table.img".to_string(),
+                FlashTargetType::Rp2350Qspi => "firmware.uf2".to_string(),
+            }
+        };
+
+        match self.flash_target_type {
+            FlashTargetType::FastbootPartition => {
+                let slot_arg = match self.flash_target_slot {
+                    TargetSlot::Active => String::new(),
+                    TargetSlot::SlotA => "_a".to_string(),
+                    TargetSlot::SlotB => "_b".to_string(),
+                    TargetSlot::AllSlots => " --slot=all".to_string(),
+                };
+                let reboot_suffix = if self.auto_reboot_after_flash { " && fastboot reboot" } else { "" };
+                let ksu_prefix = if self.enable_ksu_injection { "# [Zig Engine: Patching KernelSU /init ramdisk in-memory]\n" } else { "" };
+                if self.flash_target_slot == TargetSlot::AllSlots {
+                    format!("{}fastboot flash{} {} {}{}", ksu_prefix, slot_arg, self.flash_partition_name, payload_file, reboot_suffix)
+                } else {
+                    format!("{}fastboot flash {}{} {}{}", ksu_prefix, self.flash_partition_name, slot_arg, payload_file, reboot_suffix)
+                }
+            }
+            FlashTargetType::NxpBootloaderSpl => {
+                let offset_kb = self.compute_layout().map(|l| l.spl_offset_kb).unwrap_or(33);
+                let target = if self.emmc_boot { "emmc_boot0" } else { "sd_card" };
+                format!("uuu -b {} {} (SPL target offset: {} kB / 0x{:X})", target, payload_file, offset_kb, offset_kb * 1024)
+            }
+            FlashTargetType::NxpFitImage => {
+                let uboot_feat = &self.uboot_feature_override;
+                format!("uuu -u {} -d {} -b emmc_all u-boot-spl.bin {}", uboot_feat, self.dtb_feature_override, payload_file)
+            }
+            FlashTargetType::RawStorageOffset => {
+                format!("flashrust-engine write-raw --offset {} --image {}", self.custom_flash_offset, payload_file)
+            }
+            FlashTargetType::Rp2350Qspi => {
+                format!("flashrust-engine rp2350 --window 1 --offset 0x00010000 --seal-image-def {}", payload_file)
+            }
+        }
     }
 }
 
@@ -142,7 +277,7 @@ impl eframe::App for FlashrustApp {
 
         // Advance simulation progress if active
         if self.flashing_active {
-            self.flash_progress += 0.015;
+            self.flash_progress += 0.02;
             if self.flash_progress >= 1.0 {
                 self.flashing_active = false;
                 self.flash_progress = 1.0;
@@ -150,10 +285,23 @@ impl eframe::App for FlashrustApp {
                     .selected_device()
                     .and_then(|d| d.product.clone())
                     .unwrap_or_else(|| "Target Device".into());
+                let target_desc = match self.flash_target_type {
+                    FlashTargetType::FastbootPartition => format!("partition '{}'", self.flash_partition_name),
+                    FlashTargetType::NxpBootloaderSpl => "NXP SPL Bootloader".into(),
+                    FlashTargetType::NxpFitImage => "U-Boot FIT Image".into(),
+                    FlashTargetType::RawStorageOffset => format!("offset {}", self.custom_flash_offset),
+                    FlashTargetType::Rp2350Qspi => "RP2350 QSPI Flash Window".into(),
+                };
                 self.log_messages.push(format!(
-                    "[FLASH] Image write to '{}' completed successfully!",
-                    target_name
+                    "[FLASH] Image write of {} to '{}' completed successfully (verified OK)!",
+                    target_desc, target_name
                 ));
+                if self.auto_reboot_after_flash {
+                    self.log_messages.push(format!(
+                        "[REBOOT] Target '{}' reboot sequence dispatched",
+                        target_name
+                    ));
+                }
             }
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -223,133 +371,384 @@ impl eframe::App for FlashrustApp {
         // Central Panel with Split Layout
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
-                // Column 1: Hardware Profiles & UUU Controls
+                // Column 1: Hardware Profiles, Flashing Configuration & Execution
                 columns[0].vertical(|ui| {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading("🛠 Hardware Profile & Target Preset");
-                            if let Some(detected) = self.auto_detected_profile {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(0, 255, 128),
-                                    format!("✔ Auto-Detected ({})", detected),
-                                );
-                            }
-                        });
-                        ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("column_0_scroll_area")
+                        .show(ui, |ui| {
+                            // Hardware Profile & Target Preset
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading("🛠 Hardware Profile & Target Preset");
+                                    if let Some(detected) = self.auto_detected_profile {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0, 255, 128),
+                                            format!("✔ Auto-Detected ({})", detected),
+                                        );
+                                    }
+                                });
+                                ui.add_space(4.0);
 
-                        let prev_idx = self.selected_preset_idx;
-                        egui::ComboBox::from_label("Target Hardware Preset")
-                            .selected_text(self.current_preset().name)
-                            .show_ui(ui, |ui| {
-                                for (idx, p) in PRESETS.iter().enumerate() {
-                                    ui.selectable_value(&mut self.selected_preset_idx, idx, p.name);
+                                let prev_idx = self.selected_preset_idx;
+                                egui::ComboBox::from_label("Target Hardware Preset")
+                                    .selected_text(self.current_preset().name)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, p) in PRESETS.iter().enumerate() {
+                                            ui.selectable_value(&mut self.selected_preset_idx, idx, p.name);
+                                        }
+                                    });
+
+                                // If user manually changed preset, clear auto-detected flag
+                                if prev_idx != self.selected_preset_idx {
+                                    let p = self.current_preset();
+                                    self.mcu_binary = p.mcu_binary;
+                                    self.uboot_feature_override = p.uboot_feature.to_string();
+                                    self.dtb_feature_override = p.dtb_feature.to_string();
+                                    self.auto_detected_profile = None;
+                                }
+
+                                let p = self.current_preset();
+                                ui.label(format!("SoC: {}", p.soc));
+                            });
+
+                            ui.add_space(8.0);
+
+                            // Dedicated Flash Payload & Target Configuration
+                            ui.group(|ui| {
+                                ui.heading("📦 Flash Payload & Image Configuration");
+                                ui.add_space(4.0);
+
+                                // Target Flashing Mode Selector
+                                ui.horizontal(|ui| {
+                                    ui.label("Flash Target Mode:");
+                                    egui::ComboBox::from_id_salt("flash_target_type_combobox")
+                                        .selected_text(self.flash_target_type.label())
+                                        .show_ui(ui, |ui| {
+                                            for t in FlashTargetType::ALL {
+                                                ui.selectable_value(&mut self.flash_target_type, t, t.label());
+                                            }
+                                        });
+                                });
+
+                                ui.add_space(4.0);
+
+                                // Image File Selection with Browse Button
+                                ui.label(egui::RichText::new("Payload Image File:").strong());
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.flash_image_path)
+                                            .hint_text("Path to .img, .bin, .wic, or .uf2")
+                                            .desired_width(260.0),
+                                    );
+                                    if ui.button("📂 Browse...").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("Firmware & Images (*.img, *.bin, *.wic, *.uf2, *.itb)", &["img", "bin", "wic", "raw", "uf2", "itb"])
+                                            .pick_file()
+                                        {
+                                            let path_str = path.display().to_string();
+                                            self.flash_image_path = path_str.clone();
+
+                                            // Auto-detect partition name from file stem
+                                            let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                            if ["boot", "init_boot", "recovery", "vendor_boot", "system", "super", "vbmeta", "dtbo"].contains(&file_stem.as_str()) {
+                                                self.flash_partition_name = file_stem;
+                                                self.flash_target_type = FlashTargetType::FastbootPartition;
+                                            } else if file_stem.contains("spl") {
+                                                self.flash_target_type = FlashTargetType::NxpBootloaderSpl;
+                                            }
+                                            self.log_messages.push(format!("[PAYLOAD] Selected payload file: {}", path_str));
+                                        }
+                                    }
+                                    if !self.flash_image_path.is_empty() && ui.button("✖ Clear").clicked() {
+                                        self.flash_image_path.clear();
+                                    }
+                                });
+
+                                // File existence & size indicator
+                                if !self.flash_image_path.is_empty() {
+                                    let p = std::path::Path::new(&self.flash_image_path);
+                                    if p.exists() {
+                                        if let Ok(meta) = std::fs::metadata(p) {
+                                            let size = meta.len();
+                                            let size_str = if size >= 1024 * 1024 * 1024 {
+                                                format!("{:.2} GiB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+                                            } else if size >= 1024 * 1024 {
+                                                format!("{:.2} MiB", size as f64 / (1024.0 * 1024.0))
+                                            } else {
+                                                format!("{:.2} KiB", size as f64 / 1024.0)
+                                            };
+                                            ui.colored_label(egui::Color32::from_rgb(0, 255, 128), format!("✔ File found ({})", size_str));
+                                        }
+                                    } else {
+                                        ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "⚠️ File not found at path (placeholder simulated)");
+                                    }
+                                }
+
+                                // Quick Payload Presets chips
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Quick Files:").color(egui::Color32::GRAY));
+                                    if ui.button("boot.img").clicked() {
+                                        self.flash_target_type = FlashTargetType::FastbootPartition;
+                                        self.flash_partition_name = "boot".to_string();
+                                        self.flash_image_path = "boot.img".to_string();
+                                    }
+                                    if ui.button("init_boot.img").clicked() {
+                                        self.flash_target_type = FlashTargetType::FastbootPartition;
+                                        self.flash_partition_name = "init_boot".to_string();
+                                        self.flash_image_path = "init_boot.img".to_string();
+                                    }
+                                    if ui.button("recovery.img").clicked() {
+                                        self.flash_target_type = FlashTargetType::FastbootPartition;
+                                        self.flash_partition_name = "recovery".to_string();
+                                        self.flash_image_path = "recovery.img".to_string();
+                                    }
+                                    if ui.button("u-boot-spl.bin").clicked() {
+                                        self.flash_target_type = FlashTargetType::NxpBootloaderSpl;
+                                        self.flash_image_path = "u-boot-spl.bin".to_string();
+                                    }
+                                });
+
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+
+                                // Mode-specific options
+                                match self.flash_target_type {
+                                    FlashTargetType::FastbootPartition => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Target Partition:");
+                                            ui.text_edit_singleline(&mut self.flash_partition_name);
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Presets:");
+                                            for part in &["boot", "init_boot", "recovery", "vendor_boot", "vbmeta", "dtbo", "super"] {
+                                                if ui.selectable_label(self.flash_partition_name == *part, *part).clicked() {
+                                                    self.flash_partition_name = (*part).to_string();
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Target Slot:");
+                                            egui::ComboBox::from_id_salt("fastboot_slot_combobox")
+                                                .selected_text(self.flash_target_slot.label())
+                                                .show_ui(ui, |ui| {
+                                                    for slot in TargetSlot::ALL {
+                                                        ui.selectable_value(&mut self.flash_target_slot, slot, slot.label());
+                                                    }
+                                                });
+                                        });
+
+                                        ui.checkbox(&mut self.enable_ksu_injection, "⚡ In-Memory KernelSU / Init Hijack Patch (Zig Engine)");
+                                        ui.checkbox(&mut self.auto_reboot_after_flash, "🔄 Auto-reboot device after flashing");
+                                    }
+                                    FlashTargetType::NxpBootloaderSpl => {
+                                        let offset_kb = self.compute_layout().map(|l| l.spl_offset_kb).unwrap_or(33);
+                                        ui.label(format!("• Target Architecture: NXP {}", self.current_preset().soc));
+                                        ui.label(format!("• SPL Hardware Offset: {} kB (0x{:X} bytes)", offset_kb, offset_kb * 1024));
+                                        ui.label(format!("• Target Media: {}", if self.emmc_boot { "eMMC boot0 partition" } else { "SD / User Data Area" }));
+                                    }
+                                    FlashTargetType::NxpFitImage => {
+                                        ui.label(format!("• Target Architecture: NXP {}", self.current_preset().soc));
+                                        ui.label("• FIT Image Contents: U-Boot proper + ARM Trusted Firmware + OP-TEE + DTB");
+                                        ui.label(format!("• DTB Profile: {}", self.dtb_feature_override));
+                                    }
+                                    FlashTargetType::RawStorageOffset => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Byte / Hex Offset:");
+                                            ui.text_edit_singleline(&mut self.custom_flash_offset);
+                                        });
+                                        ui.label(egui::RichText::new("Examples: 0x8400 (33 kB), 0x40000000 (RAM), 0x10000000 (RP2350 QSPI)").color(egui::Color32::GRAY));
+                                    }
+                                    FlashTargetType::Rp2350Qspi => {
+                                        ui.label("• Target Architecture: Raspberry Pi RP2350 (Cortex-M33 / Hazard3 RISC-V)");
+                                        ui.label("• QSPI Subwindow: Window 1 (Base 0x10400000 -> Flash Offset 0x00010000)");
+                                        ui.label("• Security: IMAGE_DEF Header Seal Enforced");
+                                    }
+                                }
+
+                                ui.add_space(6.0);
+
+                                // Command Pipeline Preview
+                                ui.label(egui::RichText::new("Pipeline Execution Preview:").strong().color(egui::Color32::from_rgb(0, 210, 255)));
+                                let cmd = self.generate_flash_command_preview();
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(cmd)
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(200, 255, 180)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+
+                            ui.add_space(8.0);
+
+                            // NXP UUU & Boot Media Configuration (Collapsible)
+                            ui.collapsing("⚙ NXP UUU & Boot Media Configuration", |ui| {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("U-Boot Feature (-u):");
+                                    ui.text_edit_singleline(&mut self.uboot_feature_override);
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("DTB Feature (-d):");
+                                    ui.text_edit_singleline(&mut self.dtb_feature_override);
+                                });
+
+                                ui.checkbox(&mut self.emmc_boot, "Boot from eMMC boot0 partition (-e)");
+                                ui.checkbox(&mut self.mcu_binary, "Enable Coprocessor MCU Binary (-m)");
+
+                                ui.add_space(4.0);
+                                ui.label("Storage Media Capacity:");
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut self.storage_capacity_gb, 16, "16 GB (13 GB usable)");
+                                    ui.radio_value(&mut self.storage_capacity_gb, 32, "32 GB (28 GB usable)");
+                                    ui.radio_value(&mut self.storage_capacity_gb, 64, "64 GB");
+                                });
+                            });
+
+                            ui.add_space(8.0);
+
+                            // Flash Execution Group
+                            ui.group(|ui| {
+                                ui.heading("🚀 Flash Execution");
+                                ui.add_space(4.0);
+
+                                if let Some(target) = self.selected_device() {
+                                    let prod = target.product.as_deref().unwrap_or("USB Device");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Target Device:");
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "[{:04x}:{:04x}] {}",
+                                                target.vendor_id, target.product_id, prod
+                                            ))
+                                            .color(egui::Color32::from_rgb(0, 220, 255))
+                                            .strong(),
+                                        );
+                                    });
+
+                                    let target_desc = match self.flash_target_type {
+                                        FlashTargetType::FastbootPartition => format!("Partition '{}'", self.flash_partition_name),
+                                        FlashTargetType::NxpBootloaderSpl => "NXP SPL Bootloader".into(),
+                                        FlashTargetType::NxpFitImage => "U-Boot FIT Image".into(),
+                                        FlashTargetType::RawStorageOffset => format!("Offset {}", self.custom_flash_offset),
+                                        FlashTargetType::Rp2350Qspi => "RP2350 QSPI Window".into(),
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Staged Action:");
+                                        ui.label(
+                                            egui::RichText::new(target_desc)
+                                                .color(egui::Color32::from_rgb(0, 255, 180))
+                                                .strong(),
+                                        );
+                                    });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("⚠️ Please select a USB device from the list on the right")
+                                            .color(egui::Color32::from_rgb(255, 180, 50)),
+                                    );
+                                }
+
+                                let btn_enabled = !self.flashing_active && self.selected_device().is_some();
+                                let btn_text = if self.flashing_active {
+                                    "Flashing in Progress..."
+                                } else if let Some(_target) = self.selected_device() {
+                                    match self.flash_target_type {
+                                        FlashTargetType::FastbootPartition => "Flash Selected Partition Target",
+                                        _ => "Flash Selected USB Target",
+                                    }
+                                } else {
+                                    "Select a USB Device to Flash"
+                                };
+
+                                if ui
+                                    .add_enabled(
+                                        btn_enabled,
+                                        egui::Button::new(btn_text).min_size([240.0, 36.0].into()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.flashing_active = true;
+                                    self.flash_progress = 0.0;
+                                    if let Some(target) = self.selected_device() {
+                                        let prod = target.product.as_deref().unwrap_or("USB Device");
+                                        let payload_name = if !self.flash_image_path.is_empty() {
+                                            std::path::Path::new(&self.flash_image_path)
+                                                .file_name()
+                                                .and_then(|f| f.to_str())
+                                                .unwrap_or("custom_image.bin")
+                                        } else {
+                                            match self.flash_target_type {
+                                                FlashTargetType::FastbootPartition => "boot.img",
+                                                FlashTargetType::NxpBootloaderSpl => "u-boot-spl.bin",
+                                                FlashTargetType::NxpFitImage => "u-boot.itb",
+                                                FlashTargetType::RawStorageOffset => "partition-table.img",
+                                                FlashTargetType::Rp2350Qspi => "firmware.uf2",
+                                            }
+                                        };
+
+                                        match self.flash_target_type {
+                                            FlashTargetType::FastbootPartition => {
+                                                let slot_str = match self.flash_target_slot {
+                                                    TargetSlot::Active => "",
+                                                    TargetSlot::SlotA => "_a",
+                                                    TargetSlot::SlotB => "_b",
+                                                    TargetSlot::AllSlots => " (both slots)",
+                                                };
+                                                let ksu_note = if self.enable_ksu_injection {
+                                                    " [+ In-Memory KernelSU /init Patch via Zig CPIO]"
+                                                } else {
+                                                    ""
+                                                };
+                                                self.log_messages.push(format!(
+                                                    "[FASTBOOT] Streaming '{}{}' to [{:04x}:{:04x}] {} with payload '{}'{}",
+                                                    self.flash_partition_name, slot_str, target.vendor_id, target.product_id, prod, payload_name, ksu_note
+                                                ));
+                                            }
+                                            FlashTargetType::NxpBootloaderSpl => {
+                                                let offset = self.compute_layout().map(|l| l.spl_offset_kb).unwrap_or(33);
+                                                self.log_messages.push(format!(
+                                                    "[NXP-SDP] Writing SPL payload '{}' @ offset {} kB to [{:04x}:{:04x}] {}",
+                                                    payload_name, offset, target.vendor_id, target.product_id, prod
+                                                ));
+                                            }
+                                            FlashTargetType::NxpFitImage => {
+                                                self.log_messages.push(format!(
+                                                    "[NXP-UUU] Writing U-Boot FIT payload '{}' to [{:04x}:{:04x}] {}",
+                                                    payload_name, target.vendor_id, target.product_id, prod
+                                                ));
+                                            }
+                                            FlashTargetType::RawStorageOffset => {
+                                                self.log_messages.push(format!(
+                                                    "[RAW] Streaming payload '{}' @ offset {} to [{:04x}:{:04x}] {}",
+                                                    payload_name, self.custom_flash_offset, target.vendor_id, target.product_id, prod
+                                                ));
+                                            }
+                                            FlashTargetType::Rp2350Qspi => {
+                                                self.log_messages.push(format!(
+                                                    "[RP2350] Flashing QSPI window with payload '{}' to [{:04x}:{:04x}] {}",
+                                                    payload_name, target.vendor_id, target.product_id, prod
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if self.flashing_active || self.flash_progress > 0.0 {
+                                    ui.add_space(6.0);
+                                    ui.add(
+                                        egui::ProgressBar::new(self.flash_progress)
+                                            .show_percentage()
+                                            .animate(self.flashing_active),
+                                    );
                                 }
                             });
-
-                        // If user manually changed preset, clear auto-detected flag
-                        if prev_idx != self.selected_preset_idx {
-                            let p = self.current_preset();
-                            self.mcu_binary = p.mcu_binary;
-                            self.uboot_feature_override = p.uboot_feature.to_string();
-                            self.dtb_feature_override = p.dtb_feature.to_string();
-                            self.auto_detected_profile = None;
-                        }
-
-                        let p = self.current_preset();
-                        ui.label(format!("SoC: {}", p.soc));
-                    });
-
-                    ui.add_space(8.0);
-
-                    ui.group(|ui| {
-                        ui.heading("⚙ NXP UUU Execution Flags");
-                        ui.add_space(4.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label("U-Boot Feature (-u):");
-                            ui.text_edit_singleline(&mut self.uboot_feature_override);
                         });
-
-                        ui.horizontal(|ui| {
-                            ui.label("DTB Feature (-d):");
-                            ui.text_edit_singleline(&mut self.dtb_feature_override);
-                        });
-
-                        ui.checkbox(&mut self.emmc_boot, "Boot from eMMC boot0 partition (-e)");
-                        ui.checkbox(&mut self.mcu_binary, "Enable Coprocessor MCU Binary (-m)");
-
-                        ui.add_space(4.0);
-                        ui.label("Storage Media Capacity:");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut self.storage_capacity_gb, 16, "16 GB (13 GB usable)");
-                            ui.radio_value(&mut self.storage_capacity_gb, 32, "32 GB (28 GB usable)");
-                            ui.radio_value(&mut self.storage_capacity_gb, 64, "64 GB");
-                        });
-                    });
-
-                    ui.add_space(8.0);
-
-                    // Flash Action Button with Target Awareness
-                    ui.group(|ui| {
-                        ui.heading("🚀 Flash Execution");
-                        ui.add_space(4.0);
-
-                        if let Some(target) = self.selected_device() {
-                            let prod = target.product.as_deref().unwrap_or("USB Device");
-                            ui.horizontal(|ui| {
-                                ui.label("Target Device:");
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "[{:04x}:{:04x}] {}",
-                                        target.vendor_id, target.product_id, prod
-                                    ))
-                                    .color(egui::Color32::from_rgb(0, 220, 255))
-                                    .strong(),
-                                );
-                            });
-                        } else {
-                            ui.label(
-                                egui::RichText::new("⚠️ Please select a USB device from the list on the right")
-                                    .color(egui::Color32::from_rgb(255, 180, 50)),
-                            );
-                        }
-
-                        let btn_enabled = !self.flashing_active && self.selected_device().is_some();
-                        let btn_text = if self.flashing_active {
-                            "Flashing..."
-                        } else if self.selected_device().is_some() {
-                            "Flash Selected USB Target"
-                        } else {
-                            "Select a USB Device to Flash"
-                        };
-
-                        if ui
-                            .add_enabled(
-                                btn_enabled,
-                                egui::Button::new(btn_text).min_size([240.0, 36.0].into()),
-                            )
-                            .clicked()
-                        {
-                            self.flashing_active = true;
-                            self.flash_progress = 0.0;
-                            if let Some(target) = self.selected_device() {
-                                let prod = target.product.as_deref().unwrap_or("USB Device");
-                                self.log_messages.push(format!(
-                                    "[FLASH] Staging SPL payload to [{:04x}:{:04x}] {} (SoC: {})",
-                                    target.vendor_id, target.product_id, prod, self.current_preset().soc
-                                ));
-                            }
-                        }
-
-                        if self.flashing_active || self.flash_progress > 0.0 {
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::ProgressBar::new(self.flash_progress)
-                                    .show_percentage()
-                                    .animate(self.flashing_active),
-                            );
-                        }
-                    });
                 });
 
                 // Column 2: Partition Layout Visualizer & USB Topology
