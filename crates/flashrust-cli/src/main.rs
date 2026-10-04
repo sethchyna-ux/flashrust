@@ -136,6 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Host Orchestration Engine: Rust v1.85+ (Tokio, Embassy, nusb, clap, ratatui)");
             println!("  Bare-Metal Binary Engine:  Zig {}", ZigEngine::version());
         }
+        Some(Commands::Gui) => {
+            println!("Launching Project flashrust Desktop Reactive GUI (eframe/egui)...");
+            let status = std::process::Command::new("cargo")
+                .args(["run", "-p", "flashrust-gui"])
+                .status()?;
+            if !status.success() {
+                eprintln!("Failed to launch flashrust-gui: {:?}", status);
+            }
+        }
         Some(Commands::Tui) | None => {
             tui::run_tui()?;
         }

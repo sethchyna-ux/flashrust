@@ -108,4 +108,7 @@ pub enum Commands {
 
     /// Launch interactive terminal dashboard (TUI)
     Tui,
+
+    /// Launch the native desktop reactive GUI window
+    Gui,
 }

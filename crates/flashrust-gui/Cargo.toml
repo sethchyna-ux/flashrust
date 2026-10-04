@@ -1,0 +1,10 @@
+[package]
+name = "flashrust-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+toolkit-core = { path = "../toolkit-core" }
+eframe = "0.31"

@@ -2,6 +2,7 @@
 members = [
     "crates/toolkit-core",
     "crates/flashrust-cli",
+    "crates/flashrust-gui",
 ]
 resolver = "2"
 
