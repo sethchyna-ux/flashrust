@@ -28,10 +28,10 @@ pub fn identify_operating_mode(vendor_id: u16, product_id: u16) -> DeviceOperati
         (0x1FC9, _) | (0x15A2, _) => DeviceOperatingMode::NxpSerialDownload,
 
         // Android ADB Interface
-        (0x18D1, 0x4EE7) | (0x18D1, 0x4EE0) => DeviceOperatingMode::AndroidAdb,
+        (0x18D1, 0x4EE7) | (0x18D1, 0x4EE0) | (0x22B8, 0x2E76) | (0x22B8, 0x2E82) => DeviceOperatingMode::AndroidAdb,
 
-        // Fastboot / FastbootD Mode
-        (0x18D1, 0x4EE8) => DeviceOperatingMode::Fastboot,
+        // Fastboot / FastbootD Mode (Google, Motorola, Qualcomm EDL/Fastboot)
+        (0x18D1, 0x4EE8) | (0x22B8, 0x2E80) | (0x22B8, _) => DeviceOperatingMode::Fastboot,
 
         // Samsung Loke Download Mode
         (0x04E8, 0x685D) => DeviceOperatingMode::SamsungLokeDownload,

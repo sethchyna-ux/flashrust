@@ -416,29 +416,34 @@ impl eframe::App for FlashrustApp {
                             ui.label(egui::RichText::new("No flashing targets or debug probes connected").color(egui::Color32::GRAY));
                         } else {
                             let mut new_selection = None;
-                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                                for (idx, dev) in self.devices.iter().enumerate() {
-                                    let is_selected = self.selected_device_idx == Some(idx);
-                                    let mode_color = match dev.operating_mode {
-                                        DeviceOperatingMode::NxpSerialDownload => egui::Color32::from_rgb(255, 165, 0),
-                                        DeviceOperatingMode::Fastboot => egui::Color32::from_rgb(0, 255, 128),
-                                        DeviceOperatingMode::AndroidAdb => egui::Color32::from_rgb(0, 210, 255),
-                                        DeviceOperatingMode::DebugProbe => egui::Color32::from_rgb(200, 100, 255),
-                                        DeviceOperatingMode::Rp2350BootRom | DeviceOperatingMode::Rp2040BootRom => egui::Color32::from_rgb(255, 100, 100),
-                                        _ => egui::Color32::WHITE,
-                                    };
+                            egui::ScrollArea::vertical()
+                                .id_salt("usb_devices_scroll_area")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for (idx, dev) in self.devices.iter().enumerate() {
+                                        ui.push_id(idx, |ui| {
+                                            let is_selected = self.selected_device_idx == Some(idx);
+                                            let mode_color = match dev.operating_mode {
+                                                DeviceOperatingMode::NxpSerialDownload => egui::Color32::from_rgb(255, 165, 0),
+                                                DeviceOperatingMode::Fastboot => egui::Color32::from_rgb(0, 255, 128),
+                                                DeviceOperatingMode::AndroidAdb => egui::Color32::from_rgb(0, 210, 255),
+                                                DeviceOperatingMode::DebugProbe => egui::Color32::from_rgb(200, 100, 255),
+                                                DeviceOperatingMode::Rp2350BootRom | DeviceOperatingMode::Rp2040BootRom => egui::Color32::from_rgb(255, 100, 100),
+                                                _ => egui::Color32::WHITE,
+                                            };
 
-                                    let prod = dev.product.as_deref().unwrap_or("Generic USB Device");
-                                    ui.horizontal(|ui| {
-                                        let prefix = if is_selected { "▶" } else { " " };
-                                        let label = format!("{} [{:04x}:{:04x}] {}", prefix, dev.vendor_id, dev.product_id, prod);
-                                        if ui.selectable_label(is_selected, label).clicked() {
-                                            new_selection = Some(idx);
-                                        }
-                                        ui.colored_label(mode_color, format!("({:?})", dev.operating_mode));
-                                    });
-                                }
-                            });
+                                            let prod = dev.product.as_deref().unwrap_or("Generic USB Device");
+                                            ui.horizontal(|ui| {
+                                                let prefix = if is_selected { "▶" } else { " " };
+                                                let label = format!("{} [{:04x}:{:04x}] {}", prefix, dev.vendor_id, dev.product_id, prod);
+                                                if ui.selectable_label(is_selected, label).clicked() {
+                                                    new_selection = Some(idx);
+                                                }
+                                                ui.colored_label(mode_color, format!("({:?})", dev.operating_mode));
+                                            });
+                                        });
+                                    }
+                                });
 
                             if let Some(idx) = new_selection {
                                 self.select_device(idx);
@@ -485,11 +490,16 @@ impl eframe::App for FlashrustApp {
                         ui.heading("📋 Target RTT & Event Log");
                         ui.add_space(4.0);
 
-                        egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
-                            for msg in self.log_messages.iter().rev() {
-                                ui.label(egui::RichText::new(msg).monospace().color(egui::Color32::from_rgb(220, 220, 140)));
-                            }
-                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("target_event_log_scroll_area")
+                            .max_height(110.0)
+                            .show(ui, |ui| {
+                                for (log_idx, msg) in self.log_messages.iter().rev().enumerate() {
+                                    ui.push_id(log_idx, |ui| {
+                                        ui.label(egui::RichText::new(msg).monospace().color(egui::Color32::from_rgb(220, 220, 140)));
+                                    });
+                                }
+                            });
                     });
                 });
             });
