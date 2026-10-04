@@ -4,6 +4,7 @@ pub mod error;
 pub mod nxp_transport;
 pub mod offset_validator;
 pub mod rp2350;
+pub mod su_builder;
 pub mod usb_monitor;
 pub mod uuu_builder;
 pub mod zig_bridge;
@@ -19,6 +20,9 @@ pub use offset_validator::{
     StorageLayoutPlan, MCU_BINARY_OFFSET_KB,
 };
 pub use rp2350::{DcpBenchmarkProfile, QspiWindowMapping, Rp2350Manager, DCP_PROFILES};
+pub use su_builder::{
+    SuBuildRequirements, SuDetector, TargetCpuArch, STANDALONE_SU_C_SOURCE,
+};
 pub use usb_monitor::{identify_operating_mode, list_attached_devices, DeviceOperatingMode, UsbDeviceInfo};
 pub use uuu_builder::{TargetStorage, UuuCommandBuilder};
 pub use zig_bridge::{BootHeaderVersion, BootImageMetadata, Rp2350CoreMode, ZigEngine};
@@ -224,5 +228,55 @@ mod tests {
         assert!(patched_str.contains("init.real"), "Should contain renamed init.real");
         assert!(patched_str.contains("init"), "Should contain new init entry");
         assert!(patched_cpio.windows(su_bytes.len()).any(|w| w == su_bytes));
+    }
+
+    #[test]
+    fn test_su_detector_requirements_samsung() {
+        let samsung_dev = UsbDeviceInfo {
+            vendor_id: 0x04E8,
+            product_id: 0x6860,
+            manufacturer: Some("SAMSUNG".into()),
+            product: Some("SAMSUNG_Android".into()),
+            serial_number: Some("R5CY744N4KP".into()),
+            operating_mode: DeviceOperatingMode::AndroidAdb,
+        };
+
+        let reqs = SuDetector::detect(Some(&samsung_dev), None);
+        assert_eq!(reqs.target_arch, TargetCpuArch::Aarch64);
+        assert_eq!(reqs.target_triple, "aarch64-linux-musl");
+        assert_eq!(reqs.android_abi, "arm64-v8a");
+        assert!(reqs.is_64bit);
+        assert!(reqs.compiler_detected, "Zig compiler should be detected on host");
+        assert_eq!(reqs.permissions_mode, 0o104755);
+        assert_eq!(reqs.selinux_context, "u:r:su:s0 (Permissive Domain)");
+        assert!(reqs.can_build);
+    }
+
+    #[test]
+    fn test_su_detector_build_arm64() {
+        let samsung_dev = UsbDeviceInfo {
+            vendor_id: 0x04E8,
+            product_id: 0x6860,
+            manufacturer: Some("SAMSUNG".into()),
+            product: Some("SAMSUNG_Android".into()),
+            serial_number: Some("R5CY744N4KP".into()),
+            operating_mode: DeviceOperatingMode::AndroidAdb,
+        };
+
+        let reqs = SuDetector::detect(Some(&samsung_dev), None);
+        let temp_dir = std::env::temp_dir().join("flashrust_su_test");
+        let bin_path = SuDetector::build(&reqs, &temp_dir).expect("Building static SU binary should succeed");
+
+        assert!(bin_path.exists());
+        let meta = std::fs::metadata(&bin_path).expect("File metadata");
+        assert!(meta.len() > 10_000, "Expected stripped binary > 10KB, got {}", meta.len());
+
+        let bytes = std::fs::read(&bin_path).expect("Read binary bytes");
+        assert_eq!(&bytes[0..4], b"\x7fELF");
+        assert_eq!(bytes[4], 2, "Expected 64-bit ELF (ELFCLASS64)");
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        assert_eq!(machine, 0x00B7, "Expected EM_AARCH64 machine code 0x00B7");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

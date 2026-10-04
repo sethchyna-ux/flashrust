@@ -131,6 +131,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  SELinux Permissive Su: {}", summary.selinux_patched);
             println!("  Output Written:        {}", output);
         }
+        Some(Commands::DetectSu { preset }) => {
+            let preset_ref = preset.as_deref().and_then(|p| find_preset(p).ok());
+            let devices = list_attached_devices();
+            let primary_dev = devices
+                .iter()
+                .find(|d| d.operating_mode != toolkit_core::DeviceOperatingMode::Unknown)
+                .or_else(|| devices.first());
+
+            let reqs = toolkit_core::SuDetector::detect(primary_dev, preset_ref);
+
+            println!("=======================================================");
+            println!("  flashrust Auto SU Target Requirements & Toolchain Inspector");
+            println!("=======================================================");
+            println!("  Detected Target:       {}", reqs.device_name);
+            println!("  Required CPU Arch:     {}", reqs.target_arch.label());
+            println!("  Target Triple:         {}", reqs.target_triple);
+            println!("  Android ABI:           {}", reqs.android_abi);
+            println!("  64-bit Architecture:   {}", reqs.is_64bit);
+            println!("  Binary Linkage:        {}", reqs.linkage);
+            println!("  Compiler Required:     {}", reqs.compiler_required);
+            println!(
+                "  Compiler Detected:     {} (version: {})",
+                if reqs.compiler_detected { "YES (Ready)" } else { "NO (Missing)" },
+                reqs.compiler_version.as_deref().unwrap_or("none")
+            );
+            println!("  Android NDK Detected:  {}", if reqs.ndk_detected { "YES" } else { "NO (Optional)" });
+            println!("  Source Code:           {}", reqs.source_name);
+            println!("  Target Injection Path: {}", reqs.injection_path);
+            println!("  Required File Mode:    0o{:o} (SetUID root, uid:0, gid:0)", reqs.permissions_mode);
+            println!("  SELinux Policy:        {}", reqs.selinux_context);
+            println!("  Estimated Binary Size: ~{} KB", reqs.estimated_binary_size_kb);
+            println!("  Ready to Auto-Build:   {}", if reqs.can_build { "YES" } else { "NO" });
+            println!("-------------------------------------------------------");
+            println!("  Analysis Notes:");
+            for note in &reqs.notes {
+                println!("    • {}", note);
+            }
+            println!("=======================================================");
+        }
+        Some(Commands::BuildSu { arch, output }) => {
+            let devices = list_attached_devices();
+            let primary_dev = devices
+                .iter()
+                .find(|d| d.operating_mode != toolkit_core::DeviceOperatingMode::Unknown)
+                .or_else(|| devices.first());
+
+            let mut reqs = toolkit_core::SuDetector::detect(primary_dev, None);
+            if let Some(a) = arch {
+                match a.to_lowercase().as_str() {
+                    "aarch64" | "arm64" => {
+                        reqs.target_arch = toolkit_core::TargetCpuArch::Aarch64;
+                        reqs.target_triple = "aarch64-linux-musl";
+                        reqs.android_abi = "arm64-v8a";
+                        reqs.is_64bit = true;
+                    }
+                    "armv7a" | "arm" | "armeabi-v7a" => {
+                        reqs.target_arch = toolkit_core::TargetCpuArch::ArmV7a;
+                        reqs.target_triple = "arm-linux-musleabihf";
+                        reqs.android_abi = "armeabi-v7a";
+                        reqs.is_64bit = false;
+                    }
+                    "x86_64" | "x64" => {
+                        reqs.target_arch = toolkit_core::TargetCpuArch::X86_64;
+                        reqs.target_triple = "x86_64-linux-musl";
+                        reqs.android_abi = "x86_64";
+                        reqs.is_64bit = true;
+                    }
+                    "riscv64" => {
+                        reqs.target_arch = toolkit_core::TargetCpuArch::Riscv64;
+                        reqs.target_triple = "riscv64-linux-musl";
+                        reqs.android_abi = "riscv64";
+                        reqs.is_64bit = true;
+                    }
+                    other => {
+                        eprintln!(
+                            "Unknown architecture override '{}'. Supported: aarch64, armv7a, x86_64, riscv64",
+                            other
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            println!(
+                "Building static standalone SU binary for target {} ({})...",
+                reqs.target_arch.label(),
+                reqs.target_triple
+            );
+            let out_dir = std::path::PathBuf::from(&output).join(reqs.target_triple);
+            match toolkit_core::SuDetector::build(&reqs, &out_dir) {
+                Ok(path) => {
+                    let meta = std::fs::metadata(&path)?;
+                    println!("SU binary compiled and verified successfully:");
+                    println!("  Output Path:   {}", path.display());
+                    println!("  Binary Size:   {} bytes ({:.1} KB)", meta.len(), meta.len() as f64 / 1024.0);
+                    println!("  Target Arch:   {} ({})", reqs.target_arch.label(), reqs.target_triple);
+                    println!("  Linkage:       Static musl ELF (Zero dynamic runtime dependencies)");
+                    println!("  Permissions:   chmod 04755 root:root (ready for ramdisk/boot injection)");
+                }
+                Err(e) => {
+                    eprintln!("Failed to build SU binary: {}", e);
+                }
+            }
+        }
         Some(Commands::Engine) => {
             println!("Project flashrust Dual-Engine Info:");
             println!("  Host Orchestration Engine: Rust v1.85+ (Tokio, Embassy, nusb, clap, ratatui)");

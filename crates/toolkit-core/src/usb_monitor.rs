@@ -36,6 +36,21 @@ pub fn identify_operating_mode(vendor_id: u16, product_id: u16) -> DeviceOperati
         // Samsung Loke Download Mode
         (0x04E8, 0x685D) => DeviceOperatingMode::SamsungLokeDownload,
 
+        // Samsung Android ADB / MTP
+        (0x04E8, 0x6860) | (0x04E8, 0x685E) | (0x04E8, 0x6862) | (0x04E8, 0x6864) => DeviceOperatingMode::AndroidAdb,
+
+        // Xiaomi / Redmi
+        (0x2717, 0xFF48) | (0x2717, 0xFF68) => DeviceOperatingMode::AndroidAdb,
+        (0x2717, 0xFF40) | (0x2717, 0xFF08) => DeviceOperatingMode::Fastboot,
+
+        // OnePlus / Oppo
+        (0x22D9, 0x2765) | (0x22D9, 0x2764) => DeviceOperatingMode::AndroidAdb,
+        (0x22D9, 0x2769) => DeviceOperatingMode::Fastboot,
+
+        // Qualcomm / MediaTek
+        (0x05C6, 0x9025) | (0x05C6, 0x9039) | (0x0E8D, 0x2008) => DeviceOperatingMode::AndroidAdb,
+        (0x05C6, 0x9008) | (0x0E8D, 0x201D) => DeviceOperatingMode::Fastboot,
+
         // Raspberry Pi RP2350 / RP2040 Boot ROMs
         (0x2E8A, 0x000F) => DeviceOperatingMode::Rp2350BootRom,
         (0x2E8A, 0x0003) => DeviceOperatingMode::Rp2040BootRom,

@@ -103,6 +103,24 @@ pub enum Commands {
         selinux_policy: Option<String>,
     },
 
+    /// Detect SU binary architecture and compilation requirements for connected/specified target
+    DetectSu {
+        /// Optional target SoC or preset name
+        #[arg(short, long)]
+        preset: Option<String>,
+    },
+
+    /// Build a standalone static SU binary for the detected or specified target architecture
+    BuildSu {
+        /// Target architecture override: 'aarch64', 'armv7a', 'x86_64', or 'riscv64'
+        #[arg(short, long)]
+        arch: Option<String>,
+
+        /// Output directory (default: target/su)
+        #[arg(short, long, default_value = "target/su")]
+        output: String,
+    },
+
     /// Display dual-engine runtime information (Rust Host + Zig Bare-Metal)
     Engine,
 

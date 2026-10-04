@@ -4,8 +4,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 use toolkit_core::{
     create_storage_layout_plan, detect_preset_from_usb, list_attached_devices, BoardPreset,
-    DeviceOperatingMode, StorageLayoutPlan, TargetStorage, UuuCommandBuilder, UsbDeviceInfo,
-    ZigEngine, PRESETS,
+    DeviceOperatingMode, StorageLayoutPlan, SuBuildRequirements, SuDetector,
+    TargetStorage, UuuCommandBuilder, UsbDeviceInfo, ZigEngine, PRESETS,
 };
 
 fn main() -> eframe::Result {
@@ -166,6 +166,12 @@ struct FlashrustApp {
     // In-Memory Boot Kitchen Patches
     patch_settings: BootPatchSettings,
 
+    // Target SU Binary Requirements & Automated Builder
+    su_requirements: SuBuildRequirements,
+    su_build_status: Option<String>,
+    su_is_building: bool,
+    su_build_rx: Option<Receiver<(std::result::Result<PathBuf, String>, String)>>,
+
     // Non-blocking asynchronous event channels
     log_tx: Sender<FlashLogEvent>,
     log_rx: Receiver<FlashLogEvent>,
@@ -186,6 +192,9 @@ impl FlashrustApp {
         uuu_builder.uboot_feature = Some(default_preset.uboot_feature.to_string());
         uuu_builder.dtb_feature = Some(default_preset.dtb_feature.to_string());
         uuu_builder.mcu_image = default_preset.mcu_binary;
+
+        let initial_dev_ref = initial_selected.and_then(|idx| initial_devices.get(idx));
+        let su_requirements = SuDetector::detect(initial_dev_ref, Some(default_preset));
 
         let mut app = Self {
             zig_version: ZigEngine::version(),
@@ -208,6 +217,10 @@ impl FlashrustApp {
             auto_reboot_after_flash: false,
             uuu_builder,
             patch_settings: BootPatchSettings::default(),
+            su_requirements,
+            su_build_status: None,
+            su_is_building: false,
+            su_build_rx: None,
             log_tx,
             log_rx,
         };
@@ -217,6 +230,53 @@ impl FlashrustApp {
         }
 
         app
+    }
+
+    fn refresh_su_requirements(&mut self) {
+        let dev = self.selected_device();
+        let preset = Some(self.current_preset());
+        self.su_requirements = SuDetector::detect(dev, preset);
+    }
+
+    fn trigger_su_binary_build(&mut self) {
+        if self.su_is_building || !self.su_requirements.can_build {
+            return;
+        }
+
+        self.su_is_building = true;
+        self.su_build_status = Some("Compiling static standalone SU binary...".into());
+        let reqs = self.su_requirements.clone();
+        let out_dir = PathBuf::from("target/su").join(reqs.target_triple);
+        let tx = self.log_tx.clone();
+
+        let (build_tx, build_rx) = channel();
+        self.su_build_rx = Some(build_rx);
+
+        std::thread::spawn(move || {
+            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                "[SU-BUILD] Compiling static standalone SU binary for target {} ({})...",
+                reqs.target_arch.label(),
+                reqs.target_triple
+            )));
+
+            let res = SuDetector::build(&reqs, &out_dir);
+            match res {
+                Ok(path) => {
+                    let meta = std::fs::metadata(&path).ok();
+                    let size = meta.map(|m| m.len()).unwrap_or(0);
+                    let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                        "[SU-BUILD] Successfully built SU binary: {} ({} bytes, static musl)",
+                        path.display(),
+                        size
+                    )));
+                    let _ = build_tx.send((Ok(path), reqs.target_arch.label().to_string()));
+                }
+                Err(e) => {
+                    let _ = tx.send(FlashLogEvent::Stderr(format!("[SU-BUILD-ERROR] Failed: {}", e)));
+                    let _ = build_tx.send((Err(e.to_string()), reqs.target_arch.label().to_string()));
+                }
+            }
+        });
     }
 
     fn select_device(&mut self, idx: usize) {
@@ -262,6 +322,8 @@ impl FlashrustApp {
                 }
                 _ => {}
             }
+
+            self.refresh_su_requirements();
         }
     }
 
@@ -516,6 +578,31 @@ impl eframe::App for FlashrustApp {
             }
         }
 
+        // Poll asynchronous SU binary builder results
+        if let Some(ref rx) = self.su_build_rx {
+            if let Ok((res, arch_label)) = rx.try_recv() {
+                self.su_is_building = false;
+                match res {
+                    Ok(path) => {
+                        let meta = std::fs::metadata(&path).ok();
+                        let size_kb = meta.map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0);
+                        self.patch_settings.su_custom_binary = Some(path.clone());
+                        self.patch_settings.auto_su_inject = true;
+                        self.su_build_status = Some(format!(
+                            "✅ Ready: {} ({:.1} KB, {})",
+                            path.display(),
+                            size_kb,
+                            arch_label
+                        ));
+                    }
+                    Err(e) => {
+                        self.su_build_status = Some(format!("❌ Failed: {}", e));
+                    }
+                }
+                self.su_build_rx = None;
+            }
+        }
+
         // Auto-refresh devices every 3 seconds
         if self.last_device_scan.elapsed() > Duration::from_secs(3) {
             let updated = list_attached_devices();
@@ -531,7 +618,7 @@ impl eframe::App for FlashrustApp {
             self.last_device_scan = Instant::now();
         }
 
-        if self.flashing_active {
+        if self.flashing_active || self.su_is_building {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
@@ -660,6 +747,7 @@ impl eframe::App for FlashrustApp {
                                     self.uuu_builder.uboot_feature = Some(p.uboot_feature.to_string());
                                     self.uuu_builder.dtb_feature = Some(p.dtb_feature.to_string());
                                     self.auto_detected_profile = None;
+                                    self.refresh_su_requirements();
                                 }
 
                                 ui.label(format!("Architecture: NXP {} (Cortex-A53 / A55)", self.current_preset().soc));
@@ -813,6 +901,115 @@ impl eframe::App for FlashrustApp {
                                                     );
                                                 });
                                             }
+
+                                            // Detected Architecture & SU Toolchain Requirements Inspector
+                                            ui.add_space(4.0);
+                                            egui::Frame::NONE
+                                                .fill(egui::Color32::from_rgb(12, 18, 24))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(32, 54, 72)))
+                                                .corner_radius(4.0)
+                                                .inner_margin(8.0)
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new("🔍 Target Architecture & SU Compiler Inspector")
+                                                                .strong()
+                                                                .color(egui::Color32::from_rgb(0, 220, 255)),
+                                                        );
+                                                        if self.su_requirements.can_build {
+                                                            ui.colored_label(egui::Color32::from_rgb(0, 255, 128), "● TOOLCHAIN READY");
+                                                        } else {
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 160, 0), "● TOOLCHAIN MISSING");
+                                                        }
+                                                    });
+                                                    ui.separator();
+
+                                                    egui::Grid::new("su_req_spec_grid")
+                                                        .num_columns(2)
+                                                        .spacing([12.0, 4.0])
+                                                        .striped(true)
+                                                        .show(ui, |ui| {
+                                                            ui.label("🎯 Target Hardware:");
+                                                            ui.label(egui::RichText::new(&self.su_requirements.device_name).strong());
+                                                            ui.end_row();
+
+                                                            ui.label("⚙️ Target Architecture:");
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(self.su_requirements.target_arch.label())
+                                                                        .strong()
+                                                                        .color(egui::Color32::from_rgb(0, 240, 255)),
+                                                                );
+                                                                ui.label(format!(
+                                                                    "(ABI: {}, Triple: {})",
+                                                                    self.su_requirements.android_abi,
+                                                                    self.su_requirements.target_triple
+                                                                ));
+                                                            });
+                                                            ui.end_row();
+
+                                                            ui.label("📦 Linkage Requirement:");
+                                                            ui.label(self.su_requirements.linkage);
+                                                            ui.end_row();
+
+                                                            ui.label("🔧 Compiler Toolchain:");
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(self.su_requirements.compiler_required);
+                                                                if self.su_requirements.compiler_detected {
+                                                                    ui.colored_label(
+                                                                        egui::Color32::from_rgb(0, 255, 128),
+                                                                        format!("(Detected: v{})", self.su_requirements.compiler_version.as_deref().unwrap_or("?")),
+                                                                    );
+                                                                } else {
+                                                                    ui.colored_label(egui::Color32::from_rgb(255, 80, 80), "(Missing)");
+                                                                }
+                                                            });
+                                                            ui.end_row();
+
+                                                            ui.label("🛡️ Security Policy:");
+                                                            ui.label(format!(
+                                                                "{}, Mode: 0o{:o} (root:root)",
+                                                                self.su_requirements.selinux_context,
+                                                                self.su_requirements.permissions_mode
+                                                            ));
+                                                            ui.end_row();
+                                                        });
+
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal(|ui| {
+                                                        let btn_text = format!(
+                                                            "🔨 Auto-Build SU Binary for {}",
+                                                            self.su_requirements.target_arch.label()
+                                                        );
+                                                        let build_btn = ui.add_enabled(
+                                                            self.su_requirements.can_build && !self.su_is_building,
+                                                            egui::Button::new(
+                                                                egui::RichText::new(btn_text)
+                                                                    .strong()
+                                                                    .color(egui::Color32::WHITE),
+                                                            )
+                                                            .fill(egui::Color32::from_rgb(0, 110, 180)),
+                                                        );
+                                                        if build_btn.clicked() {
+                                                            self.trigger_su_binary_build();
+                                                        }
+
+                                                        if self.su_is_building {
+                                                            ui.spinner();
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(0, 200, 255),
+                                                                "Compiling static standalone SU binary via Zig...",
+                                                            );
+                                                        } else if let Some(ref status) = self.su_build_status {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(0, 255, 150),
+                                                                status,
+                                                            );
+                                                        }
+                                                    });
+                                                });
+
+                                            ui.add_space(4.0);
 
                                             // Custom SU Binary file picker or embedded universal stub
                                             ui.horizontal(|ui| {
