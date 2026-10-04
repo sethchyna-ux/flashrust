@@ -5,6 +5,7 @@ pub mod nxp_transport;
 pub mod offset_validator;
 pub mod rp2350;
 pub mod usb_monitor;
+pub mod uuu_builder;
 pub mod zig_bridge;
 
 pub use board_presets::{detect_preset_from_usb, find_preset, BoardPreset, PRESETS};
@@ -19,6 +20,7 @@ pub use offset_validator::{
 };
 pub use rp2350::{DcpBenchmarkProfile, QspiWindowMapping, Rp2350Manager, DCP_PROFILES};
 pub use usb_monitor::{identify_operating_mode, list_attached_devices, DeviceOperatingMode, UsbDeviceInfo};
+pub use uuu_builder::{TargetStorage, UuuCommandBuilder};
 pub use zig_bridge::{BootHeaderVersion, BootImageMetadata, Rp2350CoreMode, ZigEngine};
 
 #[cfg(test)]
