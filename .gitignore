@@ -1,0 +1,6 @@
+/target
+zig/zig-out
+zig/.zig-cache
+.zig-cache
+zig/*.a
+zig/*.o

@@ -1,0 +1,152 @@
+const std = @import("std");
+
+pub const cpio = @import("cpio.zig");
+pub const rp2350 = @import("rp2350.zig");
+pub const boot_img = @import("boot_img.zig");
+pub const selinux = @import("selinux.zig");
+
+pub const VERSION: [:0]const u8 = "0.1.0-alpha";
+
+export fn flashrust_zig_version() [*:0]const u8 {
+    return VERSION.ptr;
+}
+
+export fn flashrust_zig_parse_cpio_header(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_filesize: *u64,
+    out_namesize: *u32,
+) c_int {
+    const ptr = data_ptr orelse return -1;
+    const slice = ptr[0..data_len];
+    const header = cpio.parseNewcHeader(slice) catch return -2;
+    out_filesize.* = header.filesize;
+    out_namesize.* = header.namesize;
+    return 0;
+}
+
+export fn flashrust_zig_patch_cpio_init(
+    input_ptr: ?[*]const u8,
+    input_len: usize,
+    inject_ptr: ?[*]const u8,
+    inject_len: usize,
+    out_buf_ptr: ?[*]u8,
+    out_buf_cap: usize,
+    out_len: *usize,
+) c_int {
+    const in_slice = (input_ptr orelse return -1)[0..input_len];
+    const inj_slice = (inject_ptr orelse return -1)[0..inject_len];
+    const out_slice = (out_buf_ptr orelse return -1)[0..out_buf_cap];
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const written = cpio.patchInitHijack(allocator, in_slice, inj_slice, out_slice) catch |err| switch (err) {
+        error.BufferTooShort => return -2,
+        error.InvalidMagic => return -3,
+        error.InvalidHexField => return -4,
+        error.BufferOverflow => return -5,
+        error.InitNotFound => return -6,
+        error.OutOfMemory => return -7,
+    };
+
+    out_len.* = written;
+    return 0;
+}
+
+export fn flashrust_zig_parse_boot_image(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_version: *u32,
+    out_kernel_size: *u32,
+    out_ramdisk_size: *u32,
+    out_ramdisk_offset: *usize,
+    out_page_size: *u32,
+) c_int {
+    const ptr = (data_ptr orelse return -1)[0..data_len];
+    const meta = boot_img.parseBootImage(ptr) catch |err| switch (err) {
+        error.BufferTooSmall => return -2,
+        error.InvalidMagic => return -3,
+        error.UnsupportedHeaderVersion => return -4,
+    };
+
+    out_version.* = @intFromEnum(meta.version);
+    out_kernel_size.* = meta.kernel_size;
+    out_ramdisk_size.* = meta.ramdisk_size;
+    out_ramdisk_offset.* = meta.ramdisk_offset;
+    out_page_size.* = meta.page_size;
+    return 0;
+}
+
+export fn flashrust_zig_inject_selinux_rules(
+    policy_ptr: ?[*]const u8,
+    policy_len: usize,
+    out_buf_ptr: ?[*]u8,
+    out_buf_cap: usize,
+    out_len: *usize,
+) c_int {
+    const in_slice = (policy_ptr orelse return -1)[0..policy_len];
+    const out_slice = (out_buf_ptr orelse return -1)[0..out_buf_cap];
+
+    const written = selinux.injectPermissiveSuRule(in_slice, out_slice) catch |err| switch (err) {
+        error.BufferOverflow => return -2,
+        error.BufferTooSmall => return -3,
+        error.InvalidMagic => return -4,
+        error.PolicyCorrupted => return -5,
+    };
+
+    out_len.* = written;
+    return 0;
+}
+
+export fn flashrust_zig_verify_rp2350_image_def(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_mode: *u32,
+) c_int {
+    const ptr = data_ptr orelse return -1;
+    const slice = ptr[0..data_len];
+    const result = rp2350.verifyImageDef(slice) catch |err| switch (err) {
+        error.BufferTooSmall => return -2,
+        error.InvalidHeaderMagic => return -3,
+        error.InvalidFooterMagic => return -4,
+        error.InvalidCoreMode => return -5,
+        error.UnalignedOffset => return -6,
+        error.InvalidWindowIndex => return -7,
+    };
+    out_mode.* = @intFromEnum(result.mode);
+    return 0;
+}
+
+export fn flashrust_zig_seal_rp2350_image_def(
+    buf_ptr: ?[*]u8,
+    buf_len: usize,
+    mode_val: u32,
+    entry_point: u32,
+) c_int {
+    const ptr = buf_ptr orelse return -1;
+    const slice = ptr[0..buf_len];
+    const mode = rp2350.parseCoreMode(mode_val) catch return -2;
+    rp2350.sealImageDef(slice, mode, entry_point) catch |err| switch (err) {
+        error.BufferTooSmall => return -3,
+        error.InvalidHeaderMagic, error.InvalidFooterMagic, error.InvalidCoreMode, error.UnalignedOffset, error.InvalidWindowIndex => return -4,
+    };
+    return 0;
+}
+
+export fn flashrust_zig_calculate_qspi_window(
+    window_idx: u32,
+    physical_offset: u32,
+    out_virtual_base: *u32,
+    out_register_val: *u32,
+) c_int {
+    const cfg = rp2350.calculateQspiWindow(window_idx, physical_offset) catch |err| switch (err) {
+        error.InvalidWindowIndex => return -1,
+        error.UnalignedOffset => return -2,
+        else => return -3,
+    };
+    out_virtual_base.* = cfg.virtual_base;
+    out_register_val.* = cfg.register_val;
+    return 0;
+}
