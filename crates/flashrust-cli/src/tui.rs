@@ -13,7 +13,7 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
-use toolkit_core::{list_attached_devices, PRESETS, UsbDeviceInfo, ZigEngine};
+use toolkit_core::{detect_preset_from_usb, list_attached_devices, PRESETS, UsbDeviceInfo, ZigEngine};
 
 pub struct TerminalGuard {
     stdout: Stdout,
@@ -117,16 +117,20 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             f.render_widget(header, chunks[0]);
 
             // 2. Flashing Progress Bar (Gauge)
-            let selected_dev_desc = cached_devices.get(selected_device_idx).map(|d| {
+            let selected_dev = cached_devices.get(selected_device_idx);
+            let auto_preset = selected_dev.and_then(|d| detect_preset_from_usb(d));
+            let selected_dev_desc = selected_dev.map(|d| {
                 format!("[{:04x}:{:04x}] {}", d.vendor_id, d.product_id, d.product.as_deref().unwrap_or("USB Target"))
             }).unwrap_or_else(|| "No Target Selected".into());
 
+            let profile_desc = auto_preset.map(|p| format!(" (Profile: {})", p.name)).unwrap_or_default();
+
             let gauge_title = if flash_sim_active {
-                format!(" Streaming Chunks to {} (Speed: {:.1} MiB/s) ", selected_dev_desc, flash_speed_mib)
+                format!(" Streaming Chunks to {}{} (Speed: {:.1} MiB/s) ", selected_dev_desc, profile_desc, flash_speed_mib)
             } else if flash_progress == 100 {
-                format!(" Flashing Complete to {} (100%) ", selected_dev_desc)
+                format!(" Flashing Complete to {}{} (100%) ", selected_dev_desc, profile_desc)
             } else {
-                format!(" Target: {} | Press [f] to flash selected device ", selected_dev_desc)
+                format!(" Target: {}{} | Press [f] to flash ", selected_dev_desc, profile_desc)
             };
 
             let gauge = Gauge::default()

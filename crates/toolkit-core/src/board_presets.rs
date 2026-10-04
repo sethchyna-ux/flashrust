@@ -1,4 +1,5 @@
 use crate::error::{FlashrustError, Result};
+use crate::usb_monitor::UsbDeviceInfo;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,4 +64,47 @@ pub fn find_preset(name_or_soc: &str) -> Result<&'static BoardPreset> {
         }
     }
     Err(FlashrustError::UnknownBoardPreset(name_or_soc.to_string()))
+}
+
+/// Auto-detect the matching board preset from an attached USB device
+pub fn detect_preset_from_usb(dev: &UsbDeviceInfo) -> Option<&'static BoardPreset> {
+    // 1. Exact PID matching for NXP Serial Download Boot ROM (VID 0x1FC9 or 0x15A2)
+    if dev.vendor_id == 0x1FC9 || dev.vendor_id == 0x15A2 {
+        match dev.product_id {
+            0x013E | 0x0134 => return find_preset("imx8mm").ok(),
+            0x0139 => return find_preset("imx8mn").ok(),
+            0x0146 => return find_preset("imx8mp").ok(),
+            0x014C => return find_preset("imx8ulp").ok(),
+            0x014E | 0x0150 => return find_preset("imx95").ok(),
+            0x0151 | 0x0152 => return find_preset("imx952").ok(),
+            _ => {}
+        }
+    }
+
+    // 2. String heuristic matching across product descriptor and manufacturer
+    let mut search_text = String::new();
+    if let Some(ref prod) = dev.product {
+        search_text.push_str(prod);
+        search_text.push(' ');
+    }
+    if let Some(ref mfg) = dev.manufacturer {
+        search_text.push_str(mfg);
+    }
+    let lower = search_text.to_ascii_lowercase();
+
+    if lower.contains("8mm") || lower.contains("8m mini") {
+        find_preset("imx8mm").ok()
+    } else if lower.contains("8mn") || lower.contains("8m nano") {
+        find_preset("imx8mn").ok()
+    } else if lower.contains("8mp") || lower.contains("8m plus") {
+        find_preset("imx8mp").ok()
+    } else if lower.contains("8ulp") {
+        find_preset("imx8ulp").ok()
+    } else if lower.contains("952") {
+        find_preset("imx952").ok()
+    } else if lower.contains("imx95") || lower.contains("frdm") || lower.contains("i.mx95") {
+        find_preset("imx95").ok()
+    } else {
+        None
+    }
 }

@@ -1,8 +1,8 @@
 use eframe::egui;
 use std::time::{Duration, Instant};
 use toolkit_core::{
-    create_storage_layout_plan, list_attached_devices, BoardPreset, DeviceOperatingMode,
-    StorageLayoutPlan, UsbDeviceInfo, ZigEngine, PRESETS,
+    create_storage_layout_plan, detect_preset_from_usb, list_attached_devices, BoardPreset,
+    DeviceOperatingMode, StorageLayoutPlan, UsbDeviceInfo, ZigEngine, PRESETS,
 };
 
 fn main() -> eframe::Result {
@@ -28,6 +28,7 @@ fn main() -> eframe::Result {
 struct FlashrustApp {
     zig_version: &'static str,
     selected_preset_idx: usize,
+    auto_detected_profile: Option<&'static str>,
     emmc_boot: bool,
     mcu_binary: bool,
     storage_capacity_gb: u64,
@@ -45,30 +46,65 @@ impl FlashrustApp {
     fn new() -> Self {
         let default_preset = &PRESETS[0];
         let initial_devices = list_attached_devices();
-        // Auto-select first recognized target device if available, otherwise first device
+        // Prefer first recognized target device if available, otherwise first device
         let initial_selected = initial_devices
             .iter()
             .position(|d| d.operating_mode != DeviceOperatingMode::Unknown)
             .or_else(|| if initial_devices.is_empty() { None } else { Some(0) });
 
-        Self {
+        let mut app = Self {
             zig_version: ZigEngine::version(),
             selected_preset_idx: 0,
+            auto_detected_profile: None,
             emmc_boot: false,
             mcu_binary: default_preset.mcu_binary,
             storage_capacity_gb: 32,
             uboot_feature_override: default_preset.uboot_feature.to_string(),
             dtb_feature_override: default_preset.dtb_feature.to_string(),
             devices: initial_devices,
-            selected_device_idx: initial_selected,
+            selected_device_idx: None,
             last_device_scan: Instant::now(),
             flashing_active: false,
             flash_progress: 0.0,
             log_messages: vec![
                 "[SYSTEM] flashrust Host Orchestrator initialized".into(),
                 format!("[ENGINE] Zig Bare-Metal Engine: {}", ZigEngine::version()),
-                "[USB] nusb monitoring active - click any device to select it as flash target".into(),
+                "[USB] nusb monitoring active - selecting a target auto-detects its hardware profile".into(),
             ],
+        };
+
+        if let Some(idx) = initial_selected {
+            app.select_device(idx);
+        }
+
+        app
+    }
+
+    fn select_device(&mut self, idx: usize) {
+        self.selected_device_idx = Some(idx);
+        if let Some(dev) = self.devices.get(idx) {
+            let prod = dev.product.as_deref().unwrap_or("USB Device");
+            self.log_messages.push(format!(
+                "[USB] Selected target device: [{:04x}:{:04x}] {}",
+                dev.vendor_id, dev.product_id, prod
+            ));
+
+            // Auto-detect matching hardware profile from USB
+            if let Some(detected_preset) = detect_preset_from_usb(dev) {
+                if let Some(pos) = PRESETS.iter().position(|p| p.name == detected_preset.name) {
+                    self.selected_preset_idx = pos;
+                    self.mcu_binary = detected_preset.mcu_binary;
+                    self.uboot_feature_override = detected_preset.uboot_feature.to_string();
+                    self.dtb_feature_override = detected_preset.dtb_feature.to_string();
+                    self.auto_detected_profile = Some(detected_preset.name);
+                    self.log_messages.push(format!(
+                        "[PROFILE] Auto-detected board profile '{}' from USB target [{:04x}:{:04x}]",
+                        detected_preset.name, dev.vendor_id, dev.product_id
+                    ));
+                }
+            } else {
+                self.auto_detected_profile = None;
+            }
         }
     }
 
@@ -98,7 +134,7 @@ impl eframe::App for FlashrustApp {
                 let pid = current.product_id;
                 self.selected_device_idx = updated.iter().position(|d| d.vendor_id == vid && d.product_id == pid);
             } else if !updated.is_empty() && self.selected_device_idx.is_none() {
-                self.selected_device_idx = Some(0);
+                self.select_device(0);
             }
             self.devices = updated;
             self.last_device_scan = Instant::now();
@@ -156,10 +192,15 @@ impl eframe::App for FlashrustApp {
                 ui.separator();
                 if let Some(target) = self.selected_device() {
                     let prod = target.product.as_deref().unwrap_or("USB Device");
+                    let profile_tag = if let Some(prof) = self.auto_detected_profile {
+                        format!(" (Profile: {})", prof)
+                    } else {
+                        String::new()
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "🎯 Active Target: [{:04x}:{:04x}] {} ({:?})",
-                            target.vendor_id, target.product_id, prod, target.operating_mode
+                            "🎯 Active Target: [{:04x}:{:04x}] {}{}",
+                            target.vendor_id, target.product_id, prod, profile_tag
                         ))
                         .color(egui::Color32::from_rgb(0, 255, 180)),
                     );
@@ -185,7 +226,15 @@ impl eframe::App for FlashrustApp {
                 // Column 1: Hardware Profiles & UUU Controls
                 columns[0].vertical(|ui| {
                     ui.group(|ui| {
-                        ui.heading("🛠 Hardware Profile & Target Preset");
+                        ui.horizontal(|ui| {
+                            ui.heading("🛠 Hardware Profile & Target Preset");
+                            if let Some(detected) = self.auto_detected_profile {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0, 255, 128),
+                                    format!("✔ Auto-Detected ({})", detected),
+                                );
+                            }
+                        });
                         ui.add_space(4.0);
 
                         let prev_idx = self.selected_preset_idx;
@@ -197,12 +246,13 @@ impl eframe::App for FlashrustApp {
                                 }
                             });
 
-                        // If preset changed, update defaults
+                        // If user manually changed preset, clear auto-detected flag
                         if prev_idx != self.selected_preset_idx {
                             let p = self.current_preset();
                             self.mcu_binary = p.mcu_binary;
                             self.uboot_feature_override = p.uboot_feature.to_string();
                             self.dtb_feature_override = p.dtb_feature.to_string();
+                            self.auto_detected_profile = None;
                         }
 
                         let p = self.current_preset();
@@ -358,13 +408,14 @@ impl eframe::App for FlashrustApp {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.heading("🔌 Attached USB Devices");
-                            ui.label(egui::RichText::new("(Click to select target)").italics().color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("(Click to auto-configure profile)").italics().color(egui::Color32::GRAY));
                         });
                         ui.add_space(4.0);
 
                         if self.devices.is_empty() {
                             ui.label(egui::RichText::new("No flashing targets or debug probes connected").color(egui::Color32::GRAY));
                         } else {
+                            let mut new_selection = None;
                             egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
                                 for (idx, dev) in self.devices.iter().enumerate() {
                                     let is_selected = self.selected_device_idx == Some(idx);
@@ -373,6 +424,7 @@ impl eframe::App for FlashrustApp {
                                         DeviceOperatingMode::Fastboot => egui::Color32::from_rgb(0, 255, 128),
                                         DeviceOperatingMode::AndroidAdb => egui::Color32::from_rgb(0, 210, 255),
                                         DeviceOperatingMode::DebugProbe => egui::Color32::from_rgb(200, 100, 255),
+                                        DeviceOperatingMode::Rp2350BootRom | DeviceOperatingMode::Rp2040BootRom => egui::Color32::from_rgb(255, 100, 100),
                                         _ => egui::Color32::WHITE,
                                     };
 
@@ -381,16 +433,16 @@ impl eframe::App for FlashrustApp {
                                         let prefix = if is_selected { "▶" } else { " " };
                                         let label = format!("{} [{:04x}:{:04x}] {}", prefix, dev.vendor_id, dev.product_id, prod);
                                         if ui.selectable_label(is_selected, label).clicked() {
-                                            self.selected_device_idx = Some(idx);
-                                            self.log_messages.push(format!(
-                                                "[USB] Selected target device: [{:04x}:{:04x}] {}",
-                                                dev.vendor_id, dev.product_id, prod
-                                            ));
+                                            new_selection = Some(idx);
                                         }
                                         ui.colored_label(mode_color, format!("({:?})", dev.operating_mode));
                                     });
                                 }
                             });
+
+                            if let Some(idx) = new_selection {
+                                self.select_device(idx);
+                            }
 
                             // Display inspector panel for the selected device
                             if let Some(target) = self.selected_device() {
@@ -406,6 +458,15 @@ impl eframe::App for FlashrustApp {
                                             ui.separator();
                                             ui.label(format!("Mode: {:?}", target.operating_mode));
                                         });
+
+                                        ui.horizontal(|ui| {
+                                            if let Some(prof) = self.auto_detected_profile {
+                                                ui.label(egui::RichText::new(format!("Hardware Profile: {} (Auto-Configured)", prof)).color(egui::Color32::from_rgb(0, 255, 128)).strong());
+                                            } else {
+                                                ui.label(egui::RichText::new(format!("Hardware Profile: {} (Manual)", self.current_preset().name)).color(egui::Color32::GRAY));
+                                            }
+                                        });
+
                                         if let Some(ref mfg) = target.manufacturer {
                                             ui.label(format!("Manufacturer: {}", mfg));
                                         }

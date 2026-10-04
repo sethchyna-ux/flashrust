@@ -7,6 +7,8 @@ pub enum DeviceOperatingMode {
     Fastboot,
     SamsungLokeDownload,
     DebugProbe,
+    Rp2350BootRom,
+    Rp2040BootRom,
     Unknown,
 }
 
@@ -34,8 +36,12 @@ pub fn identify_operating_mode(vendor_id: u16, product_id: u16) -> DeviceOperati
         // Samsung Loke Download Mode
         (0x04E8, 0x685D) => DeviceOperatingMode::SamsungLokeDownload,
 
-        // Debug Probes (CMSIS-DAP / ST-Link / J-Link)
-        (0x1366, _) | (0x0483, _) => DeviceOperatingMode::DebugProbe,
+        // Raspberry Pi RP2350 / RP2040 Boot ROMs
+        (0x2E8A, 0x000F) => DeviceOperatingMode::Rp2350BootRom,
+        (0x2E8A, 0x0003) => DeviceOperatingMode::Rp2040BootRom,
+
+        // Debug Probes (CMSIS-DAP / ST-Link / J-Link / DAPLink)
+        (0x1366, _) | (0x0483, _) | (0x0D28, _) => DeviceOperatingMode::DebugProbe,
 
         _ => DeviceOperatingMode::Unknown,
     }

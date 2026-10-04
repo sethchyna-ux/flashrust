@@ -7,7 +7,7 @@ pub mod rp2350;
 pub mod usb_monitor;
 pub mod zig_bridge;
 
-pub use board_presets::{find_preset, BoardPreset, PRESETS};
+pub use board_presets::{detect_preset_from_usb, find_preset, BoardPreset, PRESETS};
 pub use boot_kitchen::{BootKitchen, InitHijackTarget, PatchSummary};
 pub use error::{FlashrustError, Result};
 pub use nxp_transport::{
@@ -47,6 +47,33 @@ mod tests {
         assert_eq!(preset.uboot_feature, "trusty-dual");
         assert_eq!(preset.dtb_feature, "mipi-panel");
         assert!(!preset.mcu_binary);
+    }
+
+    #[test]
+    fn test_detect_preset_from_usb() {
+        // Test NXP i.MX 8M Mini PID 0x013E
+        let nxp_8mm = UsbDeviceInfo {
+            vendor_id: 0x1FC9,
+            product_id: 0x013E,
+            manufacturer: Some("NXP Semiconductors".into()),
+            product: Some("SE Blank 8MMini".into()),
+            serial_number: None,
+            operating_mode: DeviceOperatingMode::NxpSerialDownload,
+        };
+        let detected = detect_preset_from_usb(&nxp_8mm).expect("Should detect imx8mm");
+        assert_eq!(detected.soc, "imx8mm");
+
+        // Test descriptor string heuristic for i.MX 95
+        let frdm_95 = UsbDeviceInfo {
+            vendor_id: 0x1FC9,
+            product_id: 0x0999, // Unlisted PID but product string has FRDM
+            manufacturer: Some("NXP".into()),
+            product: Some("FRDM-IMX95 Freedom Board".into()),
+            serial_number: None,
+            operating_mode: DeviceOperatingMode::NxpSerialDownload,
+        };
+        let detected_95 = detect_preset_from_usb(&frdm_95).expect("Should detect imx95");
+        assert_eq!(detected_95.soc, "imx95");
     }
 
     #[test]
