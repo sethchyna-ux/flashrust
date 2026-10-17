@@ -1026,8 +1026,8 @@ impl OdinProtocolEngine {
 
     /// Force-transition a connected Samsung device into **Real Odin / Loke Download Mode** using:
     /// 1. Samsung USB Modem `AT+FUS?\r\n` (Firmware Update Service Download Mode trigger) over `/dev/cu.usbmodem*`
-    /// 2. `adb reboot download` (if ADB daemon is active)
-    /// 3. `fastboot oem download` / `fastboot reboot bootloader` (if Fastboot/lk mode is active)
+    /// 2. `adb reboot download`, then `adb reboot edl` (if ADB daemon is active)
+    /// 3. `fastboot reboot download`, `fastboot reboot bootloader`, then `fastboot oem download` (if Fastboot/lk mode is active)
     pub fn reboot_to_download_mode() -> Vec<String> {
         Self::reboot_to_download_mode_on(None)
     }
@@ -1072,7 +1072,7 @@ impl OdinProtocolEngine {
             }
         }
 
-        // Method 2: Try `adb reboot download`
+        // Method 2: Try `adb reboot download`, then `adb reboot edl`.
         if let Ok(out) = std::process::Command::new("adb")
             .args(["reboot", "download"])
             .output()
@@ -1085,11 +1085,30 @@ impl OdinProtocolEngine {
                     logs.push(format!("[ADB] `adb reboot download`: {}", err));
                 }
             }
+        } else {
+            // `adb reboot edl` (Emergency Download Mode) — some Samsung devices
+            // reboot straight into EDL/download mode via this path.
+            if let Ok(out) = std::process::Command::new("adb")
+                .args(["reboot", "edl"])
+                .output()
+            {
+                if out.status.success() {
+                    logs.push("[ADB] Issued `adb reboot edl` -> SUCCESS".into());
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if !err.is_empty() {
+                        logs.push(format!("[ADB] `adb reboot edl`: {}", err));
+                    }
+                }
+            }
         }
 
-        // Method 3: Try `fastboot reboot bootloader`, then `fastboot oem download`.
-        // Each attempt is bounded by a timeout so a missing fastboot device cannot hang.
-        if Self::run_fastboot_with_timeout(&["reboot", "bootloader"], 5) {
+        // Method 3: Try `fastboot reboot download`, `fastboot reboot bootloader`,
+        // then `fastboot oem download`. Each attempt is bounded by a timeout so
+        // a missing fastboot device cannot hang.
+        if Self::run_fastboot_with_timeout(&["reboot", "download"], 5) {
+            logs.push("[FASTBOOT] Issued `fastboot reboot download` -> SUCCESS".into());
+        } else if Self::run_fastboot_with_timeout(&["reboot", "bootloader"], 5) {
             logs.push("[FASTBOOT] Issued `fastboot reboot bootloader` -> SUCCESS".into());
         } else if Self::run_fastboot_with_timeout(&["oem", "download"], 5) {
             logs.push("[FASTBOOT] Issued `fastboot oem download` -> SUCCESS".into());
