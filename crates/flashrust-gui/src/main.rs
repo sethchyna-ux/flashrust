@@ -622,6 +622,7 @@ impl FlashrustApp {
         let samsung = self.samsung_config.clone();
         let samsung_custom_payload = self.samsung_custom_payload;
         let reboot = self.auto_reboot_after_flash;
+        let non_samsung_cmd = self.generate_compiled_command_preview();
 
         std::thread::spawn(move || {
             let _ = tx.send(FlashLogEvent::StatusUpdate(
@@ -673,12 +674,102 @@ impl FlashrustApp {
                 return;
             }
 
-            let _ = selected_target;
-            let _ = tx.send(FlashLogEvent::Stderr(
-                "This GUI only executes the implemented Samsung Heimdall transport. Use the dedicated CLI commands for other targets."
-                    .into(),
-            ));
-            let _ = tx.send(FlashLogEvent::Completed(false));
+            // Non-Samsung targets: execute the compiled CLI command via subprocess
+            // so every flash target type actually works from the GUI.
+            let compiled = non_samsung_cmd;
+            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                "[EXECUTE] Running compiled command: {}",
+                compiled
+            )));
+
+            let comment_lines: Vec<&str> = compiled
+                .lines()
+                .filter(|l| l.trim_start().starts_with('#'))
+                .collect();
+            let body_lines: Vec<&str> = compiled
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+
+            let body = body_lines.join(" ");
+            let mut body_parts = body.split_whitespace();
+            let program = match body_parts.next() {
+                Some(p) => p.to_string(),
+                None => {
+                    let _ = tx.send(FlashLogEvent::Stderr(
+                        "[EXECUTE-ERROR] Empty command — nothing to run.".into(),
+                    ));
+                    let _ = tx.send(FlashLogEvent::Completed(false));
+                    return;
+                }
+            };
+            let args: Vec<&str> = body_parts.collect();
+
+            for comment in &comment_lines {
+                let _ = tx.send(FlashLogEvent::Stdout(format!("# {}", comment)));
+            }
+
+            let mut child = match std::process::Command::new(&program)
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(FlashLogEvent::Stderr(format!(
+                        "[EXECUTE-ERROR] Failed to spawn {}: {}",
+                        program, e
+                    )));
+                    let _ = tx.send(FlashLogEvent::Completed(false));
+                    return;
+                }
+            };
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let tx_out = tx.clone();
+            let tx_err = tx.clone();
+
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                    let _ = tx_out.send(FlashLogEvent::Stdout(line));
+                }
+            });
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let _ = tx_err.send(FlashLogEvent::Stderr(line));
+                }
+            });
+
+            let status = match child.wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(FlashLogEvent::Stderr(format!(
+                        "[EXECUTE-ERROR] Command wait failed: {}",
+                        e
+                    )));
+                    let _ = tx.send(FlashLogEvent::Completed(false));
+                    return;
+                }
+            };
+
+            let _ = tx.send(FlashLogEvent::Progress(1.0));
+            if status.success() {
+                let _ = tx.send(FlashLogEvent::StatusUpdate(
+                    "Non-Samsung flash pipeline completed successfully.".into(),
+                ));
+                let _ = tx.send(FlashLogEvent::Completed(true));
+            } else {
+                let _ = tx.send(FlashLogEvent::Stderr(format!(
+                    "[EXECUTE-ERROR] Command exited with status {}",
+                    status
+                )));
+                let _ = tx.send(FlashLogEvent::Completed(false));
+            }
         });
     }
 }
@@ -1488,9 +1579,20 @@ impl eframe::App for FlashrustApp {
                                 });
                                 ui.separator();
 
-                                self.patch_settings.auto_su_inject = false;
-                                self.patch_settings.permissive_selinux = false;
-                                self.patch_settings.resign_avb = false;
+                                // Offline ADB Boot Image Patcher controls
+                                // (bound to patch_settings checkboxes above — state persists across frames)
+                                ui.checkbox(
+                                    &mut self.patch_settings.auto_su_inject,
+                                    "Auto SU Injection",
+                                );
+                                ui.checkbox(
+                                    &mut self.patch_settings.permissive_selinux,
+                                    "Permissive SELinux",
+                                );
+                                ui.checkbox(
+                                    &mut self.patch_settings.resign_avb,
+                                    "Resign AVB (disable verity)",
+                                );
 
                                 if self.patch_settings.auto_su_inject {
                                     ui.add_space(4.0);
