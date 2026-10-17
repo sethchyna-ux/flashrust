@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="rustGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF5722"/>
+      <stop offset="50%" stop-color="#D84315"/>
+      <stop offset="100%" stop-color="#BF360C"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="softShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- Background chip/rounded square -->
+  <rect x="40" y="40" width="432" height="432" rx="96" fill="#121212"/>
+  <rect x="40" y="40" width="432" height="432" rx="96" fill="url(#rustGrad)" fill-opacity="0.10" stroke="url(#rustGrad)" stroke-width="3"/>
+
+  <!-- Circuit traces -->
+  <g stroke="url(#rustGrad)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.55">
+    <path d="M 70 340 L 170 340 L 170 240"/>
+    <path d="M 342 170 L 242 170 L 242 270 L 342 270"/>
+    <path d="M 280 360 L 442 360"/>
+    <circle cx="170" cy="240" r="10" fill="url(#rustGrad)"/>
+    <circle cx="242" cy="270" r="10" fill="url(#rustGrad)"/>
+  </g>
+
+  <!-- Lightning bolt "F" shape -->
+  <path d="
+    M 220 118
+    L 292 118
+    L 248 206
+    L 322 206
+    L 262 342
+    L 188 342
+    L 242 254
+    L 168 254
+    L 230 118
+    Z
+  " fill="url(#rustGrad)" filter="glow"/>
+
+  <!-- Dot above the lightning 'i' -->
+  <circle cx="260" cy="172" r="22" fill="#FFFFFF" filter="glow"/>
+
+  <!-- Outer accent ring -->
+  <circle cx="256" cy="256" r="216" fill="none" stroke="url(#rustGrad)" stroke-width="4" stroke-dasharray="14 10" opacity="0.55"/>
+
+  <!-- Tiny spark dots -->
+  <circle cx="120" cy="130" r="5" fill="#FFB74D" opacity="0.9"/>
+  <circle cx="400" cy="140" r="4" fill="#FFB74D" opacity="0.8"/>
+  <circle cx="420" cy="360" r="6" fill="#FFB74D" opacity="0.85"/>
+  <circle cx="110" cy="390" r="4" fill="#FFB74D" opacity="0.75"/>
+
+  <!-- wordmark -->
+  <text x="256" y="470" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="34" font-weight="800" fill="#FFFFFF" text-anchor="middle" letter-spacing="2">FLASHRUST</text>
+</svg>
