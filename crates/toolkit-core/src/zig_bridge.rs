@@ -32,6 +32,15 @@ unsafe extern "C" {
         out_buf_cap: usize,
         out_len: *mut usize,
     ) -> c_int;
+    fn flashrust_zig_inject_adb_preauth(
+        input_ptr: *const u8,
+        input_len: usize,
+        pubkey_ptr: *const u8,
+        pubkey_len: usize,
+        out_buf_ptr: *mut u8,
+        out_buf_cap: usize,
+        out_len: *mut usize,
+    ) -> c_int;
     fn flashrust_zig_parse_boot_image(
         data_ptr: *const u8,
         data_len: usize,
@@ -64,6 +73,32 @@ unsafe extern "C" {
         buf_len: usize,
         mode_val: u32,
         entry_point: u32,
+    ) -> c_int;
+    fn flashrust_zig_parse_pit_header(
+        data_ptr: *const u8,
+        data_len: usize,
+        out_entry_count: *mut u32,
+        out_gang_8: *mut u8,
+        out_proj_8: *mut u8,
+    ) -> c_int;
+    fn flashrust_zig_parse_pit_entry(
+        data_ptr: *const u8,
+        data_len: usize,
+        entry_index: usize,
+        out_identifier: *mut u32,
+        out_block_offset: *mut u32,
+        out_block_count: *mut u32,
+        out_part_name_32: *mut u8,
+        out_flash_file_32: *mut u8,
+    ) -> c_int;
+    fn flashrust_zig_inspect_frp_partition(
+        data_ptr: *const u8,
+        data_len: usize,
+        out_marker: *mut u32,
+        out_marker_valid: *mut u32,
+        out_data_size: *mut u32,
+        out_oem_unlock_enabled: *mut u32,
+        out_has_credentials: *mut u32,
     ) -> c_int;
 }
 
@@ -127,12 +162,7 @@ impl ZigEngine {
         let mut namesize: u32 = 0;
 
         let ret = unsafe {
-            flashrust_zig_parse_cpio_header(
-                data.as_ptr(),
-                data.len(),
-                &mut filesize,
-                &mut namesize,
-            )
+            flashrust_zig_parse_cpio_header(data.as_ptr(), data.len(), &mut filesize, &mut namesize)
         };
 
         if ret != 0 {
@@ -147,10 +177,7 @@ impl ZigEngine {
 
     /// In-memory AST CPIO patcher:
     /// Renames /init to /init.real and injects an in-memory init executable (KernelSU or Magisk).
-    pub fn patch_cpio_init(
-        input_cpio: &[u8],
-        injected_init_binary: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub fn patch_cpio_init(input_cpio: &[u8], injected_init_binary: &[u8]) -> Result<Vec<u8>> {
         // Output capacity: original + injected init + headers + alignment padding
         let est_capacity = input_cpio.len() + injected_init_binary.len() + 1024;
         let mut output = vec![0u8; est_capacity];
@@ -214,6 +241,38 @@ impl ZigEngine {
             return Err(FlashrustError::ZigEngineError(
                 ret,
                 "In-memory SU binary injection failed".into(),
+            ));
+        }
+
+        output.truncate(written_len);
+        Ok(output)
+    }
+
+    /// In-memory ADB Pre-Authorization & Early-Boot Debuggable Injector:
+    /// Injects `adb_pubkey` at `/adb_keys` (mode 0o100644 root:root),
+    /// and appends `ro.debuggable=1`, `ro.adb.secure=0`, and `persist.sys.usb.config=mtp,adb`
+    /// to `prop.default` / `default.prop`.
+    pub fn inject_adb_preauth(input_cpio: &[u8], adb_pubkey: &[u8]) -> Result<Vec<u8>> {
+        let est_capacity = input_cpio.len() + adb_pubkey.len() + 2048;
+        let mut output = vec![0u8; est_capacity];
+        let mut written_len: usize = 0;
+
+        let ret = unsafe {
+            flashrust_zig_inject_adb_preauth(
+                input_cpio.as_ptr(),
+                input_cpio.len(),
+                adb_pubkey.as_ptr(),
+                adb_pubkey.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written_len,
+            )
+        };
+
+        if ret != 0 {
+            return Err(FlashrustError::ZigEngineError(
+                ret,
+                "In-memory ADB preauth injection failed".into(),
             ));
         }
 
@@ -321,9 +380,8 @@ impl ZigEngine {
     /// Verify an RP2350 256-byte IMAGE_DEF block.
     pub fn verify_rp2350_image_def(data: &[u8]) -> Result<Rp2350CoreMode> {
         let mut mode: u32 = 0;
-        let ret = unsafe {
-            flashrust_zig_verify_rp2350_image_def(data.as_ptr(), data.len(), &mut mode)
-        };
+        let ret =
+            unsafe { flashrust_zig_verify_rp2350_image_def(data.as_ptr(), data.len(), &mut mode) };
 
         if ret != 0 {
             return Err(FlashrustError::ZigEngineError(
@@ -365,5 +423,114 @@ impl ZigEngine {
         }
 
         Ok(())
+    }
+
+    /// Parse a Samsung PIT (Partition Information Table) binary header via the Zig engine.
+    pub fn parse_pit_header_raw(data: &[u8]) -> Result<(u32, String, String)> {
+        let mut entry_count: u32 = 0;
+        let mut gang = [0u8; 8];
+        let mut proj = [0u8; 8];
+
+        let ret = unsafe {
+            flashrust_zig_parse_pit_header(
+                data.as_ptr(),
+                data.len(),
+                &mut entry_count,
+                gang.as_mut_ptr(),
+                proj.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            return Err(FlashrustError::ZigEngineError(
+                ret,
+                "Failed to parse Samsung PIT header (expected magic 0x12349876)".into(),
+            ));
+        }
+
+        let clean_str = |buf: &[u8]| -> String {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        };
+
+        Ok((entry_count, clean_str(&gang), clean_str(&proj)))
+    }
+
+    /// Parse a single 132-byte Samsung PIT entry at `entry_index` via the Zig engine.
+    pub fn parse_pit_entry_raw(
+        data: &[u8],
+        entry_index: usize,
+    ) -> Result<(u32, u32, u32, String, String)> {
+        let mut id: u32 = 0;
+        let mut blk_off: u32 = 0;
+        let mut blk_cnt: u32 = 0;
+        let mut part_name = [0u8; 32];
+        let mut flash_file = [0u8; 32];
+
+        let ret = unsafe {
+            flashrust_zig_parse_pit_entry(
+                data.as_ptr(),
+                data.len(),
+                entry_index,
+                &mut id,
+                &mut blk_off,
+                &mut blk_cnt,
+                part_name.as_mut_ptr(),
+                flash_file.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            return Err(FlashrustError::ZigEngineError(
+                ret,
+                format!("Failed to parse Samsung PIT entry at index {}", entry_index),
+            ));
+        }
+
+        let clean_str = |buf: &[u8]| -> String {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        };
+
+        Ok((
+            id,
+            blk_off,
+            blk_cnt,
+            clean_str(&part_name),
+            clean_str(&flash_file),
+        ))
+    }
+
+    /// Inspect an Android `frp` / `persistent` partition image via the Zig engine.
+    pub fn inspect_frp_partition_raw(data: &[u8]) -> Result<(u32, bool, u32, bool, bool)> {
+        let mut marker: u32 = 0;
+        let mut marker_valid: u32 = 0;
+        let mut data_size: u32 = 0;
+        let mut oem_unlock: u32 = 0;
+        let mut has_creds: u32 = 0;
+
+        let ret = unsafe {
+            flashrust_zig_inspect_frp_partition(
+                data.as_ptr(),
+                data.len(),
+                &mut marker,
+                &mut marker_valid,
+                &mut data_size,
+                &mut oem_unlock,
+                &mut has_creds,
+            )
+        };
+        if ret != 0 {
+            return Err(FlashrustError::ZigEngineError(
+                ret,
+                "Failed to inspect FRP / persistent partition (minimum size 1040 bytes)".into(),
+            ));
+        }
+
+        Ok((
+            marker,
+            marker_valid != 0,
+            data_size,
+            oem_unlock != 0,
+            has_creds != 0,
+        ))
     }
 }

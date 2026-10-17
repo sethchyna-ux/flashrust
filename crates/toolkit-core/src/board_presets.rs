@@ -54,6 +54,34 @@ pub const PRESETS: &[BoardPreset] = &[
         dtb_feature: "rpmsg",
         mcu_binary: true,
     },
+    BoardPreset {
+        name: "imx6q-sabresd",
+        soc: "imx6q",
+        uboot_feature: "sd",
+        dtb_feature: "ldo",
+        mcu_binary: false,
+    },
+    BoardPreset {
+        name: "imx6ull-evk",
+        soc: "imx6ull",
+        uboot_feature: "sd",
+        dtb_feature: "14x14-evk",
+        mcu_binary: false,
+    },
+    BoardPreset {
+        name: "imx6sx-sdb",
+        soc: "imx6sx",
+        uboot_feature: "sd",
+        dtb_feature: "m4",
+        mcu_binary: true,
+    },
+    BoardPreset {
+        name: "imx7d-sabresd",
+        soc: "imx7d",
+        uboot_feature: "sd",
+        dtb_feature: "m4",
+        mcu_binary: true,
+    },
 ];
 
 pub fn find_preset(name_or_soc: &str) -> Result<&'static BoardPreset> {
@@ -71,6 +99,10 @@ pub fn detect_preset_from_usb(dev: &UsbDeviceInfo) -> Option<&'static BoardPrese
     // 1. Exact PID matching for NXP Serial Download Boot ROM (VID 0x1FC9 or 0x15A2)
     if dev.vendor_id == 0x1FC9 || dev.vendor_id == 0x15A2 {
         match dev.product_id {
+            0x0054 => return find_preset("imx6q").ok(),
+            0x0071 => return find_preset("imx6sx").ok(),
+            0x0076 => return find_preset("imx7d").ok(),
+            0x0080 => return find_preset("imx6ull").ok(),
             0x013E | 0x0134 => return find_preset("imx8mm").ok(),
             0x0139 => return find_preset("imx8mn").ok(),
             0x0146 => return find_preset("imx8mp").ok(),
@@ -92,7 +124,15 @@ pub fn detect_preset_from_usb(dev: &UsbDeviceInfo) -> Option<&'static BoardPrese
     }
     let lower = search_text.to_ascii_lowercase();
 
-    if lower.contains("8mm") || lower.contains("8m mini") {
+    if lower.contains("6ull") {
+        find_preset("imx6ull").ok()
+    } else if lower.contains("6sx") || lower.contains("6solox") {
+        find_preset("imx6sx").ok()
+    } else if lower.contains("6q") || lower.contains("6dq") {
+        find_preset("imx6q").ok()
+    } else if lower.contains("7d") || lower.contains("7dual") {
+        find_preset("imx7d").ok()
+    } else if lower.contains("8mm") || lower.contains("8m mini") {
         find_preset("imx8mm").ok()
     } else if lower.contains("8mn") || lower.contains("8m nano") {
         find_preset("imx8mn").ok()

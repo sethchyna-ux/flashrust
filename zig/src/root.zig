@@ -4,6 +4,7 @@ pub const cpio = @import("cpio.zig");
 pub const rp2350 = @import("rp2350.zig");
 pub const boot_img = @import("boot_img.zig");
 pub const selinux = @import("selinux.zig");
+pub const samsung_pit = @import("samsung_pit.zig");
 
 pub const VERSION: [:0]const u8 = "0.1.0-alpha";
 
@@ -49,6 +50,9 @@ export fn flashrust_zig_patch_cpio_init(
         error.BufferOverflow => return -5,
         error.InitNotFound => return -6,
         error.OutOfMemory => return -7,
+        error.InvalidArchive => return -8,
+        error.InvalidAdbKey => return -9,
+        error.MissingTrailer => return -10,
     };
 
     out_len.* = written;
@@ -92,6 +96,42 @@ export fn flashrust_zig_inject_su_binary(
         error.BufferOverflow => return -5,
         error.InitNotFound => return -6,
         error.OutOfMemory => return -7,
+        error.InvalidArchive => return -8,
+        error.InvalidAdbKey => return -9,
+        error.MissingTrailer => return -10,
+    };
+
+    out_len.* = written;
+    return 0;
+}
+
+export fn flashrust_zig_inject_adb_preauth(
+    input_ptr: ?[*]const u8,
+    input_len: usize,
+    pubkey_ptr: ?[*]const u8,
+    pubkey_len: usize,
+    out_buf_ptr: ?[*]u8,
+    out_buf_cap: usize,
+    out_len: *usize,
+) c_int {
+    const in_slice = (input_ptr orelse return -1)[0..input_len];
+    const key_slice = (pubkey_ptr orelse return -1)[0..pubkey_len];
+    const out_slice = (out_buf_ptr orelse return -1)[0..out_buf_cap];
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const written = cpio.injectAdbPreauth(allocator, in_slice, key_slice, out_slice) catch |err| switch (err) {
+        error.BufferTooShort => return -2,
+        error.InvalidMagic => return -3,
+        error.InvalidHexField => return -4,
+        error.BufferOverflow => return -5,
+        error.InitNotFound => return -6,
+        error.OutOfMemory => return -7,
+        error.InvalidArchive => return -8,
+        error.InvalidAdbKey => return -9,
+        error.MissingTrailer => return -10,
     };
 
     out_len.* = written;
@@ -191,5 +231,76 @@ export fn flashrust_zig_calculate_qspi_window(
     };
     out_virtual_base.* = cfg.virtual_base;
     out_register_val.* = cfg.register_val;
+    return 0;
+}
+
+export fn flashrust_zig_parse_pit_header(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_entry_count: *u32,
+    out_gang_8: ?[*]u8,
+    out_proj_8: ?[*]u8,
+) c_int {
+    const ptr = data_ptr orelse return -1;
+    const gang_out = out_gang_8 orelse return -1;
+    const proj_out = out_proj_8 orelse return -1;
+    const hdr = samsung_pit.parsePitHeader(ptr[0..data_len]) catch |err| switch (err) {
+        error.BufferTooSmall => return -2,
+        error.InvalidPitMagic => return -3,
+        error.EntryCountOverflow => return -4,
+        else => return -5,
+    };
+    out_entry_count.* = hdr.entry_count;
+    @memcpy(gang_out[0..8], &hdr.gang_name);
+    @memcpy(proj_out[0..8], &hdr.project_name);
+    return 0;
+}
+
+export fn flashrust_zig_parse_pit_entry(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    entry_index: usize,
+    out_identifier: *u32,
+    out_block_offset: *u32,
+    out_block_count: *u32,
+    out_part_name_32: ?[*]u8,
+    out_flash_file_32: ?[*]u8,
+) c_int {
+    const ptr = data_ptr orelse return -1;
+    const part_out = out_part_name_32 orelse return -1;
+    const file_out = out_flash_file_32 orelse return -1;
+    const entry = samsung_pit.parsePitEntry(ptr[0..data_len], entry_index) catch |err| switch (err) {
+        error.BufferTooSmall => return -2,
+        error.InvalidPitMagic => return -3,
+        error.EntryCountOverflow => return -4,
+        else => return -5,
+    };
+    out_identifier.* = entry.identifier;
+    out_block_offset.* = entry.block_size_or_offset;
+    out_block_count.* = entry.block_count;
+    @memcpy(part_out[0..32], &entry.partition_name);
+    @memcpy(file_out[0..32], &entry.flash_filename);
+    return 0;
+}
+
+export fn flashrust_zig_inspect_frp_partition(
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    out_marker: *u32,
+    out_marker_valid: *u32,
+    out_data_size: *u32,
+    out_oem_unlock_enabled: *u32,
+    out_has_credentials: *u32,
+) c_int {
+    const ptr = data_ptr orelse return -1;
+    const info = samsung_pit.inspectFrpPartition(ptr[0..data_len]) catch |err| switch (err) {
+        error.InvalidFrpPartitionSize => return -2,
+        else => return -3,
+    };
+    out_marker.* = info.header_marker;
+    out_marker_valid.* = if (info.marker_valid) 1 else 0;
+    out_data_size.* = info.data_Block_size;
+    out_oem_unlock_enabled.* = if (info.oem_unlock_enabled) 1 else 0;
+    out_has_credentials.* = if (info.has_credentials) 1 else 0;
     return 0;
 }

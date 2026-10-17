@@ -12,10 +12,15 @@ pub struct Cli {
 
 fn parse_hex_or_dec_u32(s: &str) -> Result<u32, String> {
     let clean = s.trim();
-    if let Some(stripped) = clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")) {
+    if let Some(stripped) = clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+    {
         u32::from_str_radix(stripped, 16).map_err(|e| format!("Invalid hex integer '{}': {}", s, e))
     } else {
-        clean.parse::<u32>().map_err(|e| format!("Invalid integer '{}': {}", s, e))
+        clean
+            .parse::<u32>()
+            .map_err(|e| format!("Invalid integer '{}': {}", s, e))
     }
 }
 
@@ -86,9 +91,9 @@ pub enum Commands {
         #[arg(short = 'b', long)]
         image: String,
 
-        /// Path to custom init executable payload (e.g. ksuinit or magiskinit)
+        /// Optional path to custom init executable payload (e.g. ksuinit or magiskinit). Optional if using --adb-preauth
         #[arg(short = 'p', long)]
-        init_payload: String,
+        init_payload: Option<String>,
 
         /// Output path for patched boot image
         #[arg(short = 'o', long)]
@@ -101,6 +106,22 @@ pub enum Commands {
         /// Optional path to SELinux policy file to inject permissive su rules
         #[arg(short = 's', long)]
         selinux_policy: Option<String>,
+
+        /// Force early-boot USB debugging & pre-authorize host Mac ADB key (`~/.android/adbkey.pub` + `ro.debuggable=1`, `ro.adb.secure=0`)
+        #[arg(long, default_value_t = false)]
+        adb_preauth: bool,
+
+        /// Android ADB public key path; defaults to `~/.android/adbkey.pub`
+        #[arg(long, requires = "adb_preauth")]
+        adb_pubkey: Option<String>,
+
+        /// Confirm that the device bootloader accepts custom boot images
+        #[arg(long, default_value_t = false, requires = "adb_preauth")]
+        confirm_unlocked: bool,
+
+        /// Permit replacing the input file when output resolves to the same path
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Detect SU binary architecture and compilation requirements for connected/specified target
@@ -119,6 +140,85 @@ pub enum Commands {
         /// Output directory (default: target/su)
         #[arg(short, long, default_value = "target/su")]
         output: String,
+    },
+
+    /// Stream-verify an Android Sparse Image (0xED26FF3A) or raw partition image (CRC32 + SHA-256)
+    Verify {
+        /// Path to sparse or raw image file
+        #[arg(short, long)]
+        image: String,
+    },
+
+    /// Inspect or patch Android Verified Boot (AVB 2.0) vbmeta.img dm-verity/verification flags
+    Vbmeta {
+        /// Path to input vbmeta.img
+        #[arg(short, long)]
+        image: String,
+
+        /// Optional output path to write vbmeta.img with dm-verity & verification disabled (flags |= 0x3)
+        #[arg(short, long)]
+        disable_verity_output: Option<String>,
+    },
+
+    /// Flash Samsung firmware through the bundled real Heimdall USB engine
+    SamsungFlash {
+        /// Optional BL (Bootloader) .tar / .tar.md5 path
+        #[arg(long)]
+        bl: Option<String>,
+
+        /// Optional AP (System/Boot) .tar / .tar.md5 path
+        #[arg(long)]
+        ap: Option<String>,
+
+        /// Optional CP (Modem/Radio) .tar / .tar.md5 path
+        #[arg(long)]
+        cp: Option<String>,
+
+        /// Optional CSC / HOME_CSC .tar / .tar.md5 path
+        #[arg(long)]
+        csc: Option<String>,
+
+        /// Optional device-specific .pit file used to validate archive-to-partition mappings
+        #[arg(long)]
+        pit: Option<String>,
+
+        /// FRP Lock state shown by Download Mode ('on' or 'off')
+        #[arg(long, default_value = "on")]
+        frp_lock: String,
+
+        /// Knox Guard state: completed, checking, prenormal, or locked
+        #[arg(long, default_value = "completed")]
+        kg_state: String,
+
+        /// Confirm that Download Mode reports OEM unlock enabled
+        #[arg(long, default_value_t = false)]
+        oem_unlock: bool,
+
+        /// Whether custom root/BootKitchen patch is active
+        #[arg(long, default_value_t = false)]
+        custom_binary: bool,
+
+        /// Leave the device in Download Mode after a successful flash
+        #[arg(long, default_value_t = false)]
+        no_reboot: bool,
+    },
+
+    /// Read-only inspection of an AOSP `frp` / `persistent` partition image
+    InspectFrp {
+        /// Path to `frp.img` / `persistent.img` to inspect
+        #[arg(short, long)]
+        image: String,
+    },
+
+    /// Probe Real vs. Fake Download Mode and reboot Samsung device into real Odin/Loke Download Mode (`AT+FUS?` / `adb reboot download`)
+    RebootDownload {
+        /// Optional serial port override (e.g. `/dev/cu.usbmodem1121201`)
+        #[arg(short, long)]
+        port: Option<String>,
+
+        /// Only probe whether the device is in Real Loke Download Mode vs. Fake/Factory AT Mode without sending reboot
+        #[arg(long, default_value_t = false)]
+        probe_only: bool,
     },
 
     /// Display dual-engine runtime information (Rust Host + Zig Bare-Metal)

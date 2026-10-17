@@ -47,7 +47,10 @@ impl TargetCpuArch {
     }
 
     pub fn is_64bit(&self) -> bool {
-        matches!(self, TargetCpuArch::Aarch64 | TargetCpuArch::X86_64 | TargetCpuArch::Riscv64)
+        matches!(
+            self,
+            TargetCpuArch::Aarch64 | TargetCpuArch::X86_64 | TargetCpuArch::Riscv64
+        )
     }
 
     pub fn elf_machine(&self) -> u16 {
@@ -197,7 +200,12 @@ impl SuDetector {
         if let Some(dev) = device {
             let prod = dev.product.as_deref().unwrap_or("USB Device");
             let mfg = dev.manufacturer.as_deref().unwrap_or("");
-            dev_label = format!("{} {} [{:04x}:{:04x}]", mfg, prod, dev.vendor_id, dev.product_id).trim().to_string();
+            dev_label = format!(
+                "{} {} [{:04x}:{:04x}]",
+                mfg, prod, dev.vendor_id, dev.product_id
+            )
+            .trim()
+            .to_string();
 
             match (dev.vendor_id, dev.product_id) {
                 // Samsung Galaxy Devices
@@ -220,10 +228,16 @@ impl SuDetector {
                     if let Some(p) = preset {
                         if p.soc.starts_with("imx8") || p.soc.starts_with("imx9") {
                             target_arch = TargetCpuArch::Aarch64;
-                            notes.push(format!("Detected NXP {} SoC: 64-bit ARM Cortex-A53/A55", p.soc));
+                            notes.push(format!(
+                                "Detected NXP {} SoC: 64-bit ARM Cortex-A53/A55",
+                                p.soc
+                            ));
                         } else {
                             target_arch = TargetCpuArch::ArmV7a;
-                            notes.push(format!("Detected NXP {} SoC: 32-bit ARM Cortex-A7/A9", p.soc));
+                            notes.push(format!(
+                                "Detected NXP {} SoC: 32-bit ARM Cortex-A7/A9",
+                                p.soc
+                            ));
                         }
                     } else {
                         target_arch = TargetCpuArch::Aarch64;
@@ -232,7 +246,9 @@ impl SuDetector {
                 // Xiaomi / OnePlus / Qualcomm / MediaTek
                 (0x2717, _) | (0x22D9, _) | (0x05C6, _) | (0x0E8D, _) => {
                     target_arch = TargetCpuArch::Aarch64;
-                    notes.push("Detected Qualcomm / MediaTek architecture: ARM64 (arm64-v8a)".into());
+                    notes.push(
+                        "Detected Qualcomm / MediaTek architecture: ARM64 (arm64-v8a)".into(),
+                    );
                 }
                 // Raspberry Pi RP2350
                 (0x2E8A, 0x000F) => {
@@ -278,7 +294,10 @@ impl SuDetector {
         if ndk_detected {
             notes.push(format!(
                 "Android NDK detected at {}",
-                ndk_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                ndk_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             ));
         }
 
@@ -311,17 +330,17 @@ impl SuDetector {
     }
 
     fn detect_zig() -> (bool, Option<String>, Option<PathBuf>) {
-        if let Ok(out) = Command::new("zig").arg("version").output() {
-            if out.status.success() {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let path = Command::new("which")
-                    .arg("zig")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|p| PathBuf::from(p.trim()));
-                return (true, Some(ver), path);
-            }
+        if let Ok(out) = Command::new("zig").arg("version").output()
+            && out.status.success()
+        {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let path = Command::new("which")
+                .arg("zig")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|p| PathBuf::from(p.trim()));
+            return (true, Some(ver), path);
         }
         (false, None, None)
     }
@@ -383,8 +402,9 @@ impl SuDetector {
         }
 
         // Validate generated binary
-        let bin_bytes = fs::read(&out_bin)
-            .map_err(|e| FlashrustError::IoError(format!("Failed to read compiled SU binary: {}", e)))?;
+        let bin_bytes = fs::read(&out_bin).map_err(|e| {
+            FlashrustError::IoError(format!("Failed to read compiled SU binary: {}", e))
+        })?;
 
         if bin_bytes.len() < 52 {
             return Err(FlashrustError::StorageValidationError(

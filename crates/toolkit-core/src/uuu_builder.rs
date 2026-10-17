@@ -72,18 +72,18 @@ impl UuuCommandBuilder {
             args.push("-e".to_string());
         }
 
-        if let Some(ref u) = self.uboot_feature {
-            if !u.is_empty() {
-                args.push("-u".to_string());
-                args.push(u.clone());
-            }
+        if let Some(ref u) = self.uboot_feature
+            && !u.is_empty()
+        {
+            args.push("-u".to_string());
+            args.push(u.clone());
         }
 
-        if let Some(ref d) = self.dtb_feature {
-            if !d.is_empty() {
-                args.push("-d".to_string());
-                args.push(d.clone());
-            }
+        if let Some(ref d) = self.dtb_feature
+            && !d.is_empty()
+        {
+            args.push("-d".to_string());
+            args.push(d.clone());
         }
 
         if self.mcu_image {
@@ -134,7 +134,10 @@ mod tests {
         let builder = UuuCommandBuilder::new("imx8mm");
         let args = builder.build_args();
         assert_eq!(args, vec!["-f", "imx8mm"]);
-        assert_eq!(builder.to_command_string(), "uuu_imx_android_flash.sh -f imx8mm");
+        assert_eq!(
+            builder.to_command_string(),
+            "uuu_imx_android_flash.sh -f imx8mm"
+        );
     }
 
     #[test]

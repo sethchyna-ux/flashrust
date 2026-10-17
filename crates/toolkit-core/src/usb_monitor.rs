@@ -28,7 +28,9 @@ pub fn identify_operating_mode(vendor_id: u16, product_id: u16) -> DeviceOperati
         (0x1FC9, _) | (0x15A2, _) => DeviceOperatingMode::NxpSerialDownload,
 
         // Android ADB Interface
-        (0x18D1, 0x4EE7) | (0x18D1, 0x4EE0) | (0x22B8, 0x2E76) | (0x22B8, 0x2E82) => DeviceOperatingMode::AndroidAdb,
+        (0x18D1, 0x4EE7) | (0x18D1, 0x4EE0) | (0x22B8, 0x2E76) | (0x22B8, 0x2E82) => {
+            DeviceOperatingMode::AndroidAdb
+        }
 
         // Fastboot / FastbootD Mode (Google, Motorola, Qualcomm EDL/Fastboot)
         (0x18D1, 0x4EE8) | (0x22B8, 0x2E80) | (0x22B8, _) => DeviceOperatingMode::Fastboot,
@@ -37,7 +39,9 @@ pub fn identify_operating_mode(vendor_id: u16, product_id: u16) -> DeviceOperati
         (0x04E8, 0x685D) => DeviceOperatingMode::SamsungLokeDownload,
 
         // Samsung Android ADB / MTP
-        (0x04E8, 0x6860) | (0x04E8, 0x685E) | (0x04E8, 0x6862) | (0x04E8, 0x6864) => DeviceOperatingMode::AndroidAdb,
+        (0x04E8, 0x6860) | (0x04E8, 0x685E) | (0x04E8, 0x6862) | (0x04E8, 0x6864) => {
+            DeviceOperatingMode::AndroidAdb
+        }
 
         // Xiaomi / Redmi
         (0x2717, 0xFF48) | (0x2717, 0xFF68) => DeviceOperatingMode::AndroidAdb,

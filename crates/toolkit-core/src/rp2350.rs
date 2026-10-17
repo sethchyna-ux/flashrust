@@ -47,7 +47,8 @@ impl Rp2350Manager {
         physical_offset: u32,
         mode: Rp2350CoreMode,
     ) -> Result<QspiWindowMapping> {
-        let (virtual_base, reg_val) = ZigEngine::calculate_qspi_window(window_idx, physical_offset)?;
+        let (virtual_base, reg_val) =
+            ZigEngine::calculate_qspi_window(window_idx, physical_offset)?;
 
         Ok(QspiWindowMapping {
             window_index: window_idx,

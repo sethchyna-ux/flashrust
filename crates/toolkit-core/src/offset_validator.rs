@@ -7,14 +7,15 @@ pub const MCU_BINARY_OFFSET_KB: u64 = 5120; // 5120 kB (5.12 MB)
 pub const PARTITION_TABLE_13GB: &str = "partition-table-13GB.img";
 pub const PARTITION_TABLE_DEFAULT: &str = "partition-table.img";
 
-/// Returns the required SPL (Secondary Program Loader) offset in kB.
+/// Returns the required SPL (Secondary Program Loader) / IVT offset in kB.
 pub fn get_required_spl_offset_kb(soc_name: &str, is_emmc_boot: bool) -> u64 {
     if is_emmc_boot {
         return 0; // eMMC boot0 hardware partition starts at offset 0
     }
     match soc_name.to_ascii_lowercase().as_str() {
+        "imx6q" | "imx6dl" | "imx6ull" | "imx6sx" | "imx7d" | "imx7s" => 1, // 1 kB IVT offset for i.MX 6 / 7
         "imx8mm" | "imx8mq" => 33, // 33 kB offset for 8M Mini / 8M Quad MMC
-        "imx8mn" => 32,           // 32 kB offset for 8M Nano MMC
+        "imx8mn" => 32,            // 32 kB offset for 8M Nano MMC
         "imx8mp" | "imx8ulp" | "imx95" | "imx952" => 32, // 32 kB offset for SD
         _ => 32,
     }
@@ -51,12 +52,18 @@ pub fn create_storage_layout_plan(
 ) -> Result<StorageLayoutPlan> {
     let spl_kb = get_required_spl_offset_kb(soc_name, is_emmc_boot);
     let spl_bytes = spl_kb * 1024;
+    let is_legacy_mbr_soc = spl_kb == 1;
+    let protected_header_bytes = if is_legacy_mbr_soc {
+        512 // Legacy i.MX 6/7 BootROM places IVT at 1024 bytes after 512-byte MBR
+    } else {
+        GPT_HEADER_SIZE_BYTES
+    };
 
-    // Check boundary overlap with GPT header on non-eMMC
-    if !is_emmc_boot && spl_bytes < GPT_HEADER_SIZE_BYTES {
+    // Check boundary overlap with partition header on non-eMMC
+    if !is_emmc_boot && spl_bytes < protected_header_bytes {
         return Err(FlashrustError::StorageValidationError(format!(
             "SPL offset ({} bytes) collides with Primary GPT header ({} bytes)",
-            spl_bytes, GPT_HEADER_SIZE_BYTES
+            spl_bytes, protected_header_bytes
         )));
     }
 
@@ -73,7 +80,7 @@ pub fn create_storage_layout_plan(
         is_emmc_boot,
         spl_offset_kb: spl_kb,
         spl_offset_bytes: spl_bytes,
-        gpt_header_bytes: GPT_HEADER_SIZE_BYTES,
+        gpt_header_bytes: protected_header_bytes,
         mcu_firmware_enabled: has_mcu_firmware,
         mcu_offset_kb: mcu_offset,
         storage_capacity_bytes,

@@ -1,19 +1,58 @@
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use toolkit_core::{
-    create_storage_layout_plan, detect_preset_from_usb, list_attached_devices, BoardPreset,
-    DeviceOperatingMode, StorageLayoutPlan, SuBuildRequirements, SuDetector,
-    TargetStorage, UuuCommandBuilder, UsbDeviceInfo, ZigEngine, PRESETS,
+    BoardPreset, BootKitchen, DeviceOperatingMode, FrpLockState, FrpPartitionInspector,
+    FrpPartitionReport, HeimdallEngine, KgLockState, OdinProtocolEngine, PRESETS, PatchSummary,
+    PitTable, SamsungDetectedSubMode, SamsungModeProbeReport, SamsungOdinConfig, StorageLayoutPlan,
+    SuBuildRequirements, SuDetector, TargetStorage, UsbDeviceInfo, UuuCommandBuilder, ZigEngine,
+    create_storage_layout_plan, detect_preset_from_usb, list_attached_devices,
 };
+
+type BootPatchJobResult = std::result::Result<(PathBuf, PatchSummary), String>;
+
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Output path has no filename",
+        )
+    })?;
+    let temporary_path = parent.join(format!(
+        ".{}.flashrust-{}.tmp",
+        filename.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut temporary = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary_path)?;
+    let result = (|| {
+        temporary.write_all(bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        std::fs::rename(&temporary_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([920.0, 640.0])
-            .with_title("Project flashrust | Dual-Engine Firmware Flasher & Bootloader Toolkit"),
+            .with_inner_size([1240.0, 820.0])
+            .with_min_inner_size([960.0, 660.0])
+            .with_title("Project flashrust | Samsung Firmware Inspector & Offline Boot Patcher"),
         ..Default::default()
     };
 
@@ -30,6 +69,7 @@ fn main() -> eframe::Result {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashTargetType {
+    SamsungOdinLoke,
     FastbootPartition,
     NxpBootloaderSpl,
     NxpFitImage,
@@ -38,7 +78,8 @@ pub enum FlashTargetType {
 }
 
 impl FlashTargetType {
-    pub const ALL: [FlashTargetType; 5] = [
+    pub const ALL: [FlashTargetType; 6] = [
+        FlashTargetType::SamsungOdinLoke,
         FlashTargetType::FastbootPartition,
         FlashTargetType::NxpBootloaderSpl,
         FlashTargetType::NxpFitImage,
@@ -48,6 +89,9 @@ impl FlashTargetType {
 
     pub fn label(&self) -> &'static str {
         match self {
+            FlashTargetType::SamsungOdinLoke => {
+                "Samsung Odin / Loke Download Mode (BL/AP/CP/CSC + FRP)"
+            }
             FlashTargetType::FastbootPartition => "Fastboot Partition (Android)",
             FlashTargetType::NxpBootloaderSpl => "NXP SPL Bootloader (Raw/eMMC)",
             FlashTargetType::NxpFitImage => "NXP FIT / OS Image (UUU)",
@@ -85,9 +129,9 @@ impl TargetSlot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuInjectType {
-    KernelSuGki,       // Automated in-memory GKI /init takeover
-    StandaloneSu,      // Injects setuid root su binary to system/bin/su or bin/su
-    MagiskApplet,      // Magiskinit overlayfs ramdisk entrypoint
+    KernelSuGki,  // Automated in-memory GKI /init takeover
+    StandaloneSu, // Injects setuid root su binary to system/bin/su or bin/su
+    MagiskApplet, // Magiskinit overlayfs ramdisk entrypoint
 }
 
 impl SuInjectType {
@@ -116,6 +160,7 @@ pub struct BootPatchSettings {
     pub permissive_selinux: bool,
     pub resign_avb: bool,
     pub custom_kernel_img: Option<PathBuf>,
+    pub adb_preauth: bool,
 }
 
 impl Default for BootPatchSettings {
@@ -126,9 +171,10 @@ impl Default for BootPatchSettings {
             su_target_path: "system/bin/su".to_string(),
             su_custom_binary: None,
             setuid_root: true,
-            permissive_selinux: true,
-            resign_avb: true,
+            permissive_selinux: false,
+            resign_avb: false,
             custom_kernel_img: None,
+            adb_preauth: false,
         }
     }
 }
@@ -160,11 +206,25 @@ struct FlashrustApp {
     custom_flash_offset: String,
     auto_reboot_after_flash: bool,
 
+    // Samsung Odin / Loke & FRP Studio State
+    samsung_config: SamsungOdinConfig,
+    pit_table: Option<PitTable>,
+    frp_report: Option<FrpPartitionReport>,
+    samsung_mode_report: Option<SamsungModeProbeReport>,
+    samsung_flash_confirmed: bool,
+    samsung_custom_payload: bool,
+
     // NXP UUU Command Builder & Overrides
     uuu_builder: UuuCommandBuilder,
 
     // In-Memory Boot Kitchen Patches
     patch_settings: BootPatchSettings,
+    boot_image_path: Option<PathBuf>,
+    adb_public_key_path: Option<PathBuf>,
+    custom_image_confirmed: bool,
+    boot_patch_active: bool,
+    boot_patch_status: Option<String>,
+    boot_patch_rx: Option<Receiver<BootPatchJobResult>>,
 
     // Target SU Binary Requirements & Automated Builder
     su_requirements: SuBuildRequirements,
@@ -184,7 +244,13 @@ impl FlashrustApp {
         let initial_selected = initial_devices
             .iter()
             .position(|d| d.operating_mode != DeviceOperatingMode::Unknown)
-            .or_else(|| if initial_devices.is_empty() { None } else { Some(0) });
+            .or({
+                if initial_devices.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }
+            });
 
         let (log_tx, log_rx) = channel();
 
@@ -208,15 +274,30 @@ impl FlashrustApp {
             log_messages: vec![
                 "[SYSTEM] flashrust Host Orchestrator initialized".into(),
                 format!("[ENGINE] Zig Bare-Metal Engine: {}", ZigEngine::version()),
-                "[USB] Pure-Rust nusb hotplug daemon active - targets auto-configure on insertion".into(),
+                "[ODIN] Samsung Loke Download Mode (04E8:685D) & PIT/FRP Inspector Ready".into(),
+                "[USB] Pure-Rust nusb hotplug daemon active - targets auto-configure on insertion"
+                    .into(),
             ],
-            flash_target_type: FlashTargetType::FastbootPartition,
+            flash_target_type: FlashTargetType::SamsungOdinLoke,
             flash_partition_name: "boot".to_string(),
             flash_target_slot: TargetSlot::Active,
             custom_flash_offset: "0x8400".to_string(),
-            auto_reboot_after_flash: false,
+            auto_reboot_after_flash: true,
+            samsung_config: SamsungOdinConfig::default(),
+            pit_table: None,
+            frp_report: None,
+            samsung_mode_report: None,
+            samsung_flash_confirmed: false,
+            samsung_custom_payload: false,
             uuu_builder,
             patch_settings: BootPatchSettings::default(),
+            boot_image_path: None,
+            adb_public_key_path: BootKitchen::default_adb_public_key_path()
+                .filter(|path| path.is_file()),
+            custom_image_confirmed: false,
+            boot_patch_active: false,
+            boot_patch_status: None,
+            boot_patch_rx: None,
             su_requirements,
             su_build_status: None,
             su_is_building: false,
@@ -272,8 +353,12 @@ impl FlashrustApp {
                     let _ = build_tx.send((Ok(path), reqs.target_arch.label().to_string()));
                 }
                 Err(e) => {
-                    let _ = tx.send(FlashLogEvent::Stderr(format!("[SU-BUILD-ERROR] Failed: {}", e)));
-                    let _ = build_tx.send((Err(e.to_string()), reqs.target_arch.label().to_string()));
+                    let _ = tx.send(FlashLogEvent::Stderr(format!(
+                        "[SU-BUILD-ERROR] Failed: {}",
+                        e
+                    )));
+                    let _ =
+                        build_tx.send((Err(e.to_string()), reqs.target_arch.label().to_string()));
                 }
             }
         });
@@ -294,7 +379,8 @@ impl FlashrustApp {
                     self.selected_preset_idx = pos;
                     self.uuu_builder.soc_name = detected_preset.soc.to_string();
                     self.uuu_builder.mcu_image = detected_preset.mcu_binary;
-                    self.uuu_builder.uboot_feature = Some(detected_preset.uboot_feature.to_string());
+                    self.uuu_builder.uboot_feature =
+                        Some(detected_preset.uboot_feature.to_string());
                     self.uuu_builder.dtb_feature = Some(detected_preset.dtb_feature.to_string());
                     self.auto_detected_profile = Some(detected_preset.name);
                     self.log_messages.push(format!(
@@ -308,8 +394,15 @@ impl FlashrustApp {
 
             // Auto-configure payload mode based on target operating mode
             match dev.operating_mode {
+                DeviceOperatingMode::SamsungLokeDownload => {
+                    self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                }
                 DeviceOperatingMode::Fastboot | DeviceOperatingMode::AndroidAdb => {
-                    self.flash_target_type = FlashTargetType::FastbootPartition;
+                    if dev.vendor_id == 0x04E8 {
+                        self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                    } else {
+                        self.flash_target_type = FlashTargetType::FastbootPartition;
+                    }
                     if self.flash_partition_name.is_empty() {
                         self.flash_partition_name = "boot".to_string();
                     }
@@ -332,7 +425,8 @@ impl FlashrustApp {
     }
 
     fn selected_device(&self) -> Option<&UsbDeviceInfo> {
-        self.selected_device_idx.and_then(|idx| self.devices.get(idx))
+        self.selected_device_idx
+            .and_then(|idx| self.devices.get(idx))
     }
 
     fn compute_layout(&self) -> Option<StorageLayoutPlan> {
@@ -344,6 +438,24 @@ impl FlashrustApp {
 
     fn generate_compiled_command_preview(&self) -> String {
         match self.flash_target_type {
+            FlashTargetType::SamsungOdinLoke => {
+                let preflight = self
+                    .samsung_config
+                    .evaluate_preflight(self.samsung_custom_payload);
+                let header_comment = format!(
+                    "# [{} | {}]\n# [{}]\n",
+                    self.samsung_config.frp_lock_state.label(),
+                    self.samsung_config.kg_lock_state.label(),
+                    preflight.status_headline
+                );
+                let mut command = self
+                    .samsung_config
+                    .to_command_string(self.auto_reboot_after_flash);
+                if self.samsung_custom_payload {
+                    command.push_str(" --custom-binary");
+                }
+                format!("{header_comment}{command}")
+            }
             FlashTargetType::FastbootPartition => {
                 let slot_arg = match self.flash_target_slot {
                     TargetSlot::Active => String::new(),
@@ -365,9 +477,15 @@ impl FlashrustApp {
                 };
                 let su_note = if self.patch_settings.auto_su_inject {
                     match self.patch_settings.su_inject_type {
-                        SuInjectType::KernelSuGki => "# [Zig Engine: Auto SU Injection -> KernelSU /init GKI Hijack]\n",
-                        SuInjectType::StandaloneSu => "# [Zig Engine: Auto SU Injection -> Standalone SetUID /bin/su (04755 root:root)]\n",
-                        SuInjectType::MagiskApplet => "# [Zig Engine: Auto SU Injection -> Magiskinit Boot Applet]\n",
+                        SuInjectType::KernelSuGki => {
+                            "# [Zig Engine: Auto SU Injection -> KernelSU /init GKI Hijack]\n"
+                        }
+                        SuInjectType::StandaloneSu => {
+                            "# [Zig Engine: Auto SU Injection -> Standalone SetUID /bin/su (04755 root:root)]\n"
+                        }
+                        SuInjectType::MagiskApplet => {
+                            "# [Zig Engine: Auto SU Injection -> Magiskinit Boot Applet]\n"
+                        }
                     }
                 } else {
                     ""
@@ -414,26 +532,95 @@ impl FlashrustApp {
         }
     }
 
+    fn trigger_adb_patch_export(&mut self, output_path: PathBuf) {
+        if self.boot_patch_active {
+            return;
+        }
+        let Some(input_path) = self.boot_image_path.clone() else {
+            self.boot_patch_status = Some("Select a boot or init_boot image first".into());
+            return;
+        };
+        let Some(key_path) = self.adb_public_key_path.clone() else {
+            self.boot_patch_status = Some("Select an Android adbkey.pub file first".into());
+            return;
+        };
+        if !self.custom_image_confirmed {
+            self.boot_patch_status =
+                Some("Confirm that this device accepts custom boot images before exporting".into());
+            return;
+        }
+        if self.flash_target_type == FlashTargetType::SamsungOdinLoke
+            && !self
+                .samsung_config
+                .evaluate_preflight(true)
+                .current_payload_allowed
+        {
+            self.boot_patch_status = Some(
+                "Samsung preflight blocks custom images until FRP is off, OEM unlock is enabled, and KG is completed"
+                    .into(),
+            );
+            return;
+        }
+        let same_path = input_path == output_path
+            || match (
+                std::fs::canonicalize(&input_path),
+                std::fs::canonicalize(&output_path),
+            ) {
+                (Ok(input), Ok(output)) => input == output,
+                _ => false,
+            };
+        if same_path {
+            self.boot_patch_status = Some("Choose an output path different from the input".into());
+            return;
+        }
+
+        self.boot_patch_active = true;
+        self.boot_patch_status = Some("Patching and validating boot image…".into());
+        let (result_tx, result_rx) = channel();
+        self.boot_patch_rx = Some(result_rx);
+        std::thread::spawn(move || {
+            let result = (|| -> BootPatchJobResult {
+                let boot = std::fs::read(&input_path)
+                    .map_err(|error| format!("Could not read {}: {error}", input_path.display()))?;
+                let key = std::fs::read(&key_path)
+                    .map_err(|error| format!("Could not read {}: {error}", key_path.display()))?;
+                let (patched, summary) = BootKitchen::patch_boot_image_adb_preauth(&boot, &key)
+                    .map_err(|error| error.to_string())?;
+                write_atomically(&output_path, &patched).map_err(|error| {
+                    format!("Could not write {}: {error}", output_path.display())
+                })?;
+                Ok((output_path, summary))
+            })();
+            let _ = result_tx.send(result);
+        });
+    }
+
     fn execute_flash_pipeline(&mut self) {
         if self.flashing_active {
             return;
         }
 
-        let Some(target) = self.selected_device().cloned() else {
+        let target_type = self.flash_target_type;
+        let selected_target = self.selected_device().cloned();
+        if target_type != FlashTargetType::SamsungOdinLoke && selected_target.is_none() {
             self.log_messages
                 .push("[ERROR] No target USB device selected for flashing".into());
             return;
-        };
+        }
+        if target_type == FlashTargetType::SamsungOdinLoke && !self.samsung_flash_confirmed {
+            self.log_messages.push(
+                "[ERROR] Confirm the firmware model and data-loss acknowledgement before flashing"
+                    .into(),
+            );
+            return;
+        }
 
         self.flashing_active = true;
         self.flash_progress = 0.0;
 
         let tx = self.log_tx.clone();
-        let target_type = self.flash_target_type;
-        let partition = self.flash_partition_name.clone();
-        let slot = self.flash_target_slot;
-        let uuu = self.uuu_builder.clone();
-        let patch = self.patch_settings.clone();
+        let samsung = self.samsung_config.clone();
+        let samsung_custom_payload = self.samsung_custom_payload;
         let reboot = self.auto_reboot_after_flash;
 
         std::thread::spawn(move || {
@@ -442,107 +629,56 @@ impl FlashrustApp {
             ));
             let _ = tx.send(FlashLogEvent::Progress(0.05));
 
-            // 1. Process In-Memory Boot Kitchen Patches if requested
-            if patch.auto_su_inject || patch.permissive_selinux {
-                let _ = tx.send(FlashLogEvent::StatusUpdate(
-                    "Executing In-Memory Boot Kitchen & SU Injection Pipeline...".into(),
-                ));
+            // Special branch for Samsung Odin / Loke Download Mode protocol
+            if target_type == FlashTargetType::SamsungOdinLoke {
+                let preflight = samsung.evaluate_preflight(samsung_custom_payload);
+                let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                    "[ODIN-PREFLIGHT] {}",
+                    preflight.status_headline
+                )));
 
-                if patch.auto_su_inject {
-                    match patch.su_inject_type {
-                        SuInjectType::KernelSuGki => {
-                            let dummy_applet = b"\x7fELF-ksuinit-applet-binary";
-                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                                "[SU-AUTO] Injected {} bytes KernelSU root supervisor into RAM archive (/init -> /init.real)",
-                                dummy_applet.len()
-                            )));
-                        }
-                        SuInjectType::StandaloneSu => {
-                            let dummy_su = b"\x7fELF-standalone-su-binary";
-                            let setuid_str = if patch.setuid_root {
-                                "mode: 0o104755 (setuid root 0:0)"
-                            } else {
-                                "mode: 0o100755"
-                            };
-                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                                "[SU-AUTO] Injected {} bytes SU binary into '{}' ({})",
-                                dummy_su.len(), patch.su_target_path, setuid_str
-                            )));
-                        }
-                        SuInjectType::MagiskApplet => {
-                            let dummy_magisk = b"\x7fELF-magiskinit-binary";
-                            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                                "[SU-AUTO] Injected {} bytes Magiskinit root entrypoint into ramdisk",
-                                dummy_magisk.len()
-                            )));
-                        }
+                if !preflight.current_payload_allowed {
+                    let _ = tx.send(FlashLogEvent::Stderr(
+                        "[BOOTLOADER-REJECT] Custom Binary (BOOT/VBMETA) Blocked by FRP / KG Lock! Disable 'Auto SU Binary Injection' to flash stock signed TARs, or enable OEM Unlock.".into(),
+                    ));
+                    let _ = tx.send(FlashLogEvent::Completed(false));
+                    return;
+                }
+
+                let result = HeimdallEngine::flash(&samsung, reboot, |line| {
+                    let _ = tx.send(FlashLogEvent::Stdout(format!("[HEIMDALL] {line}")));
+                    if let Some(percent) = line
+                        .trim()
+                        .strip_suffix('%')
+                        .and_then(|value| value.parse::<f32>().ok())
+                    {
+                        let _ = tx.send(FlashLogEvent::Progress(percent / 100.0));
+                    }
+                });
+                match result {
+                    Ok(result) => {
+                        let _ = tx.send(FlashLogEvent::Progress(1.0));
+                        let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
+                            "Real Samsung flash completed for {} partition(s): {}",
+                            result.partition_count,
+                            result.partitions.join(", ")
+                        )));
+                        let _ = tx.send(FlashLogEvent::Completed(true));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FlashLogEvent::Stderr(format!("[HEIMDALL-ERROR] {error}")));
+                        let _ = tx.send(FlashLogEvent::Completed(false));
                     }
                 }
-
-                if patch.permissive_selinux {
-                    let _ = tx.send(FlashLogEvent::StatusUpdate(
-                        "[SELINUX] Injected permissive su domain transition rules (allow su * * *) into sepolicy"
-                            .into(),
-                    ));
-                }
-
-                if patch.resign_avb {
-                    let _ = tx.send(FlashLogEvent::StatusUpdate(
-                        "[AVB] Recalculated SHA-256 partition digests & re-signed AVB vbmeta descriptors"
-                            .into(),
-                    ));
-                }
+                return;
             }
 
-            let _ = tx.send(FlashLogEvent::Progress(0.25));
-
-            // 2. Format transport command and log execution
-            let prod = target.product.as_deref().unwrap_or("USB Device");
-            let cmd_preview = match target_type {
-                FlashTargetType::FastbootPartition => {
-                    let slot_str = match slot {
-                        TargetSlot::Active => "",
-                        TargetSlot::SlotA => "_a",
-                        TargetSlot::SlotB => "_b",
-                        TargetSlot::AllSlots => " (all slots)",
-                    };
-                    format!("fastboot flash {}{} <in-memory buffer>", partition, slot_str)
-                }
-                _ => uuu.to_command_string(),
-            };
-
-            let _ = tx.send(FlashLogEvent::Stdout(format!("$ {}", cmd_preview)));
-            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                "Connected to target [{:04x}:{:04x}] {} via nusb endpoint",
-                target.vendor_id, target.product_id, prod
-            )));
-
-            // 3. Stream byte chunks across the bus with real-time progress
-            for pct in [0.45, 0.65, 0.85, 0.98] {
-                std::thread::sleep(Duration::from_millis(160));
-                let _ = tx.send(FlashLogEvent::Progress(pct));
-                let kb = (pct * 65536.0) as u32;
-                let _ = tx.send(FlashLogEvent::Stdout(format!(
-                    "Streaming chunk data: {} / 65536 kB ({:.0}%)",
-                    kb,
-                    pct * 100.0
-                )));
-            }
-
-            std::thread::sleep(Duration::from_millis(120));
-            let _ = tx.send(FlashLogEvent::Progress(1.0));
-            let _ = tx.send(FlashLogEvent::StatusUpdate(format!(
-                "Flash write verified OK on [{:04x}:{:04x}] {}",
-                target.vendor_id, target.product_id, prod
-            )));
-
-            if reboot {
-                let _ = tx.send(FlashLogEvent::StatusUpdate(
-                    "Reboot sequence issued to target bootloader".into(),
-                ));
-            }
-
-            let _ = tx.send(FlashLogEvent::Completed(true));
+            let _ = selected_target;
+            let _ = tx.send(FlashLogEvent::Stderr(
+                "This GUI only executes the implemented Samsung Heimdall transport. Use the dedicated CLI commands for other targets."
+                    .into(),
+            ));
+            let _ = tx.send(FlashLogEvent::Completed(false));
         });
     }
 }
@@ -578,29 +714,56 @@ impl eframe::App for FlashrustApp {
             }
         }
 
-        // Poll asynchronous SU binary builder results
-        if let Some(ref rx) = self.su_build_rx {
-            if let Ok((res, arch_label)) = rx.try_recv() {
-                self.su_is_building = false;
-                match res {
-                    Ok(path) => {
-                        let meta = std::fs::metadata(&path).ok();
-                        let size_kb = meta.map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0);
-                        self.patch_settings.su_custom_binary = Some(path.clone());
-                        self.patch_settings.auto_su_inject = true;
-                        self.su_build_status = Some(format!(
-                            "✅ Ready: {} ({:.1} KB, {})",
-                            path.display(),
-                            size_kb,
-                            arch_label
-                        ));
-                    }
-                    Err(e) => {
-                        self.su_build_status = Some(format!("❌ Failed: {}", e));
-                    }
+        let boot_patch_result = self
+            .boot_patch_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(result) = boot_patch_result {
+            self.boot_patch_active = false;
+            match result {
+                Ok((path, summary)) => {
+                    let message = format!(
+                        "Exported {} ({} → {} bytes, {}, preserved {} trailing bytes)",
+                        path.display(),
+                        summary.original_ramdisk_size,
+                        summary.patched_ramdisk_size,
+                        summary.ramdisk_compression.label(),
+                        summary.preserved_suffix_bytes
+                    );
+                    self.boot_patch_status = Some(format!("✅ {message}"));
+                    self.log_messages.push(format!("[ADB-PREAUTH] {message}"));
                 }
-                self.su_build_rx = None;
+                Err(error) => {
+                    self.boot_patch_status = Some(format!("❌ {error}"));
+                    self.log_messages
+                        .push(format!("[ADB-PREAUTH-ERROR] {error}"));
+                }
             }
+            self.boot_patch_rx = None;
+        }
+
+        // Poll asynchronous SU binary builder results
+        let su_build_result = self.su_build_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some((res, arch_label)) = su_build_result {
+            self.su_is_building = false;
+            match res {
+                Ok(path) => {
+                    let meta = std::fs::metadata(&path).ok();
+                    let size_kb = meta.map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0);
+                    self.patch_settings.su_custom_binary = Some(path.clone());
+                    self.patch_settings.auto_su_inject = true;
+                    self.su_build_status = Some(format!(
+                        "✅ Ready: {} ({:.1} KB, {})",
+                        path.display(),
+                        size_kb,
+                        arch_label
+                    ));
+                }
+                Err(e) => {
+                    self.su_build_status = Some(format!("❌ Failed: {}", e));
+                }
+            }
+            self.su_build_rx = None;
         }
 
         // Auto-refresh devices every 3 seconds
@@ -609,8 +772,9 @@ impl eframe::App for FlashrustApp {
             if let Some(current) = self.selected_device() {
                 let vid = current.vendor_id;
                 let pid = current.product_id;
-                self.selected_device_idx =
-                    updated.iter().position(|d| d.vendor_id == vid && d.product_id == pid);
+                self.selected_device_idx = updated
+                    .iter()
+                    .position(|d| d.vendor_id == vid && d.product_id == pid);
             } else if !updated.is_empty() && self.selected_device_idx.is_none() {
                 self.select_device(0);
             }
@@ -618,7 +782,7 @@ impl eframe::App for FlashrustApp {
             self.last_device_scan = Instant::now();
         }
 
-        if self.flashing_active || self.su_is_building {
+        if self.flashing_active || self.su_is_building || self.boot_patch_active {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
@@ -656,8 +820,7 @@ impl eframe::App for FlashrustApp {
                         );
                     } else if self.devices.is_empty() {
                         ui.label(
-                            egui::RichText::new("○ DISCONNECTED")
-                                .color(egui::Color32::LIGHT_GRAY),
+                            egui::RichText::new("○ DISCONNECTED").color(egui::Color32::LIGHT_GRAY),
                         );
                     } else {
                         ui.label(
@@ -718,8 +881,485 @@ impl eframe::App for FlashrustApp {
                     egui::ScrollArea::vertical()
                         .id_salt("column_0_scroll_area")
                         .show(ui, |ui| {
-                            // Target Hardware Profile
+                            // Target Protocol Mode Selector
                             ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading("⚡ Flash Protocol Engine");
+                                    egui::ComboBox::from_id_salt("flash_target_type_combo")
+                                        .selected_text(self.flash_target_type.label())
+                                        .show_ui(ui, |ui| {
+                                            for t in FlashTargetType::ALL {
+                                                ui.selectable_value(&mut self.flash_target_type, t, t.label());
+                                            }
+                                        });
+                                });
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Samsung Odin / Loke & FRP Lock Preflight Studio
+                            ui.group(|ui| {
+                                let preflight = self
+                                    .samsung_config
+                                    .evaluate_preflight(self.samsung_custom_payload);
+
+                                ui.horizontal(|ui| {
+                                    ui.heading("📱 Samsung Odin / Loke & FRP Studio");
+                                    let badge_color = if preflight.current_payload_allowed {
+                                        egui::Color32::from_rgb(0, 255, 140)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 90, 90)
+                                    };
+                                    ui.colored_label(
+                                        badge_color,
+                                        if preflight.current_payload_allowed {
+                                            "● FRP PREFLIGHT PASS"
+                                        } else {
+                                            "● BLOCKED BY FRP / KG LOCK"
+                                        },
+                                    );
+                                });
+                                ui.separator();
+
+                                // Bootloader Lock Status Bar (FRP LOCK / KG STATE / OEM UNLOCK)
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new("Download Mode State:").strong());
+                                    if ui
+                                        .selectable_label(
+                                            self.samsung_config.frp_lock_state == FrpLockState::On,
+                                            "🔒 FRP LOCK: ON",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.samsung_config.frp_lock_state = FrpLockState::On;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            self.samsung_config.frp_lock_state == FrpLockState::Off,
+                                            "🔓 FRP LOCK: OFF",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.samsung_config.frp_lock_state = FrpLockState::Off;
+                                    }
+
+                                    ui.checkbox(
+                                        &mut self.samsung_config.oem_unlock_enabled,
+                                        "OEM UNLOCK: ENABLED",
+                                    );
+
+                                    ui.separator();
+                                    egui::ComboBox::from_id_salt("kg_state_combo")
+                                        .selected_text(self.samsung_config.kg_lock_state.label())
+                                        .show_ui(ui, |ui| {
+                                            for kg in KgLockState::ALL {
+                                                ui.selectable_value(
+                                                    &mut self.samsung_config.kg_lock_state,
+                                                    kg,
+                                                    kg.label(),
+                                                );
+                                            }
+                                        });
+                                });
+
+                                // Live Preflight Diagnostic Box
+                                ui.add_space(4.0);
+                                let frame_bg = if preflight.current_payload_allowed {
+                                    egui::Color32::from_rgb(14, 34, 24)
+                                } else {
+                                    egui::Color32::from_rgb(42, 16, 18)
+                                };
+                                egui::Frame::NONE
+                                    .fill(frame_bg)
+                                    .corner_radius(4.0)
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(&preflight.status_headline)
+                                                .strong()
+                                                .color(if preflight.current_payload_allowed {
+                                                    egui::Color32::from_rgb(120, 255, 170)
+                                                } else {
+                                                    egui::Color32::from_rgb(255, 130, 130)
+                                                }),
+                                        );
+                                        for finding in &preflight.findings {
+                                            ui.label(format!("• {}", finding));
+                                        }
+                                        for action in &preflight.recommended_actions {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 215, 100),
+                                                format!("👉 {}", action),
+                                            );
+                                        }
+                                    });
+
+                                let heimdall_path = HeimdallEngine::find_executable();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Real USB engine:");
+                                    match heimdall_path {
+                                        Some(path) => {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(120, 255, 170),
+                                                format!("Heimdall ready ({})", path.display()),
+                                            );
+                                        }
+                                        None => {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 130, 130),
+                                                "Heimdall missing; flashing is disabled",
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.checkbox(
+                                    &mut self.samsung_flash_confirmed,
+                                    "I verified the firmware matches this exact model and understand CSC may erase user data",
+                                );
+                                ui.checkbox(
+                                    &mut self.samsung_custom_payload,
+                                    "Selected archives contain custom or modified images",
+                                );
+
+                                // Real Download Mode detection and reboot controls
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Download Mode USB Control:")
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(255, 200, 90)),
+                                    );
+                                    if ui
+                                        .button("🔍 Detect with Heimdall USB")
+                                        .clicked()
+                                    {
+                                        match HeimdallEngine::detect() {
+                                            Ok(output) => self.log_messages.push(format!(
+                                                "[HEIMDALL-DETECT] {output}"
+                                            )),
+                                            Err(error) => self.log_messages.push(format!(
+                                                "[HEIMDALL-DETECT-ERROR] {error}"
+                                            )),
+                                        }
+                                    }
+
+                                    if ui
+                                        .button(
+                                            egui::RichText::new(
+                                                "🔄 Reboot to Real Download Mode (AT+FUS? / ADB)",
+                                            )
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(0, 255, 160)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let logs = OdinProtocolEngine::reboot_to_download_mode();
+                                        for line in logs {
+                                            self.log_messages.push(format!("[ODIN-REBOOT] {}", line));
+                                        }
+                                        let rep = OdinProtocolEngine::probe_samsung_download_mode();
+                                        self.samsung_mode_report = Some(rep);
+                                    }
+
+                                    if ui
+                                        .button("🔁 Loke Reboot Device (0x67 EndSession)")
+                                        .clicked()
+                                    {
+                                        let logs = OdinProtocolEngine::loke_reboot_device();
+                                        for line in logs {
+                                            self.log_messages.push(line);
+                                        }
+                                    }
+                                });
+
+                                if let Some(ref mode_rep) = self.samsung_mode_report {
+                                    let mode_color = match mode_rep.detected_submode {
+                                        SamsungDetectedSubMode::RealLokeDownload => {
+                                            egui::Color32::from_rgb(0, 255, 150)
+                                        }
+                                        SamsungDetectedSubMode::FakeOrAtModemMode => {
+                                            egui::Color32::from_rgb(255, 185, 60)
+                                        }
+                                        SamsungDetectedSubMode::UnresponsiveOrBusy => {
+                                            egui::Color32::from_rgb(255, 130, 110)
+                                        }
+                                        SamsungDetectedSubMode::NoSerialPortFound => {
+                                            egui::Color32::LIGHT_GRAY
+                                        }
+                                    };
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_rgb(22, 26, 36))
+                                        .corner_radius(4.0)
+                                        .inner_margin(6.0)
+                                        .show(ui, |ui| {
+                                            ui.colored_label(
+                                                mode_color,
+                                                format!(
+                                                    "📡 Mode Probe: {} (Port: {})",
+                                                    mode_rep.detected_submode.label(),
+                                                    mode_rep
+                                                        .serial_port
+                                                        .as_deref()
+                                                        .unwrap_or("No /dev/cu.usbmodem* found")
+                                                ),
+                                            );
+                                            if let Some(ref t) = mode_rep.parsed_telemetry {
+                                                egui::Frame::NONE
+                                                    .fill(egui::Color32::from_rgb(16, 22, 30))
+                                                    .corner_radius(4.0)
+                                                    .inner_margin(6.0)
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new("📱 Model:").strong());
+                                                            ui.colored_label(egui::Color32::from_rgb(0, 240, 255), &t.model);
+                                                            ui.separator();
+                                                            ui.label(egui::RichText::new("⚡ Bootloader Bit:").strong());
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 215, 0), format!("Bit {}", t.sw_rev_bit));
+                                                            ui.separator();
+                                                            ui.label(egui::RichText::new("🌐 Carrier:").strong());
+                                                            ui.label(&t.carrier_prd);
+                                                        });
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new("🏷️ Firmware:").strong());
+                                                            ui.small(&t.firmware_version);
+                                                            ui.separator();
+                                                            ui.label(egui::RichText::new("🔌 USB State:").strong());
+                                                            ui.colored_label(
+                                                                if t.usb_composition.contains("ADB") {
+                                                                    egui::Color32::from_rgb(0, 255, 128)
+                                                                } else {
+                                                                    egui::Color32::from_rgb(255, 170, 50)
+                                                                },
+                                                                &t.usb_composition,
+                                                            );
+                                                            ui.separator();
+                                                            ui.label(egui::RichText::new("🔒 Lock:").strong());
+                                                            ui.label(&t.lock_status);
+                                                        });
+                                                        ui.small(format!("Serial: {} | IMEI: {}", t.serial_number, t.imei));
+                                                    });
+                                            } else if let Some(ref info) = mode_rep.devconinfo {
+                                                ui.small(format!("AT+DEVCONINFO: {}", info));
+                                            }
+                                            if !mode_rep.raw_response.is_empty() {
+                                                ui.small(format!(
+                                                    "Raw Serial Reply: {}",
+                                                    mode_rep.raw_response
+                                                ));
+                                            }
+                                            ui.small(format!("• {}", mode_rep.summary));
+                                        });
+                                }
+
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new("Odin 4-Slot Firmware Packages (.tar / .tar.md5) & PIT:")
+                                        .strong(),
+                                );
+
+                                egui::Grid::new("samsung_odin_slots_grid")
+                                    .num_columns(3)
+                                    .spacing([10.0, 6.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        // BL Slot
+                                        ui.label("BL (Bootloader):");
+                                        let bl_str = self
+                                            .samsung_config
+                                            .bl_tar
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "BL_*.tar.md5 (sboot.bin / param.bin)".into());
+                                        ui.add_enabled(
+                                            false,
+                                            egui::TextEdit::singleline(&mut bl_str.clone()).desired_width(180.0),
+                                        );
+                                        if ui.button("📂 Select BL").clicked()
+                                            && let Some(f) = rfd::FileDialog::new()
+                                                .add_filter("Odin TAR (*.tar, *.md5)", &["tar", "md5"])
+                                                .pick_file()
+                                        {
+                                                if let Ok(m) = OdinProtocolEngine::inspect_tar_file(&f, self.pit_table.as_ref()) {
+                                                    self.log_messages.push(format!(
+                                                        "[ODIN-BL] Loaded {} ({} files, {} bytes, MD5 trailer: {})",
+                                                        m.archive_path, m.entries.len(), m.total_payload_bytes, m.has_md5_trailer
+                                                    ));
+                                                }
+                                                self.samsung_config.bl_tar = Some(f);
+                                                self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                                        }
+                                        ui.end_row();
+
+                                        // AP Slot
+                                        ui.label("AP (System / Boot):");
+                                        let ap_str = self
+                                            .samsung_config
+                                            .ap_tar
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "AP_*.tar.md5 (boot / super / vbmeta)".into());
+                                        ui.add_enabled(
+                                            false,
+                                            egui::TextEdit::singleline(&mut ap_str.clone()).desired_width(180.0),
+                                        );
+                                        if ui.button("📂 Select AP").clicked()
+                                            && let Some(f) = rfd::FileDialog::new()
+                                                .add_filter("Odin TAR (*.tar, *.md5)", &["tar", "md5"])
+                                                .pick_file()
+                                        {
+                                                if let Ok(m) = OdinProtocolEngine::inspect_tar_file(&f, self.pit_table.as_ref()) {
+                                                    self.log_messages.push(format!(
+                                                        "[ODIN-AP] Loaded {} ({} files, {} bytes, MD5 trailer: {})",
+                                                        m.archive_path, m.entries.len(), m.total_payload_bytes, m.has_md5_trailer
+                                                    ));
+                                                }
+                                                self.samsung_config.ap_tar = Some(f);
+                                                self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                                        }
+                                        ui.end_row();
+
+                                        // CP Slot
+                                        ui.label("CP (Modem / Radio):");
+                                        let cp_str = self
+                                            .samsung_config
+                                            .cp_tar
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "CP_*.tar.md5 (modem.bin)".into());
+                                        ui.add_enabled(
+                                            false,
+                                            egui::TextEdit::singleline(&mut cp_str.clone()).desired_width(180.0),
+                                        );
+                                        if ui.button("📂 Select CP").clicked()
+                                            && let Some(f) = rfd::FileDialog::new()
+                                                .add_filter("Odin TAR (*.tar, *.md5)", &["tar", "md5"])
+                                                .pick_file()
+                                        {
+                                                self.samsung_config.cp_tar = Some(f);
+                                                self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                                        }
+                                        ui.end_row();
+
+                                        // CSC Slot
+                                        ui.label("CSC / HOME_CSC:");
+                                        let csc_str = self
+                                            .samsung_config
+                                            .csc_tar
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "CSC_*.tar.md5 (optics / prism / pit)".into());
+                                        ui.add_enabled(
+                                            false,
+                                            egui::TextEdit::singleline(&mut csc_str.clone()).desired_width(180.0),
+                                        );
+                                        if ui.button("📂 Select CSC").clicked()
+                                            && let Some(f) = rfd::FileDialog::new()
+                                                .add_filter("Odin TAR (*.tar, *.md5)", &["tar", "md5"])
+                                                .pick_file()
+                                        {
+                                                self.samsung_config.csc_tar = Some(f);
+                                                self.flash_target_type = FlashTargetType::SamsungOdinLoke;
+                                        }
+                                        ui.end_row();
+                                    });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Device PIT mapping:");
+                                    ui.label(
+                                        self.samsung_config
+                                            .pit_file
+                                            .as_ref()
+                                            .map(|path| path.display().to_string())
+                                            .unwrap_or_else(|| {
+                                                "None (matching CSC/HOME_CSC must contain PIT)".into()
+                                            }),
+                                    );
+                                    if ui.button("📂 Select device .pit").clicked()
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("Samsung PIT", &["pit"])
+                                            .pick_file()
+                                    {
+                                        match std::fs::read(&path)
+                                            .map_err(|error| error.to_string())
+                                            .and_then(|bytes| {
+                                                PitTable::parse_bytes(&bytes)
+                                                    .map_err(|error| error.to_string())
+                                            })
+                                        {
+                                            Ok(table) => {
+                                                self.log_messages.push(format!(
+                                                    "[ODIN-PIT] Loaded {} / {} with {} entries",
+                                                    table.project_name,
+                                                    table.gang_name,
+                                                    table.entries.len()
+                                                ));
+                                                self.samsung_config.pit_file = Some(path);
+                                                self.pit_table = Some(table);
+                                            }
+                                            Err(error) => self.log_messages.push(format!(
+                                                "[ODIN-PIT-ERROR] {error}"
+                                            )),
+                                        }
+                                    }
+                                });
+
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Authorized FRP / Persistent Partition Inspector (Zig):")
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(0, 220, 255)),
+                                    );
+                                    if ui.button("🔍 Inspect frp.img / persistent.img").clicked()
+                                        && let Some(file) = rfd::FileDialog::new()
+                                            .add_filter("Partition Images (*.img, *.bin)", &["img", "bin"])
+                                            .pick_file()
+                                        && let Ok(bytes) = std::fs::read(&file)
+                                    {
+                                                match FrpPartitionInspector::inspect_bytes(&bytes) {
+                                                    Ok(rep) => {
+                                                        self.log_messages.push(format!(
+                                                            "[FRP-INSPECT] {}: Marker 0x{:08X} (valid={}), OEM Unlock={}, SHA-256 Match={}",
+                                                            file.display(),
+                                                            rep.header_marker,
+                                                            rep.marker_valid,
+                                                            rep.oem_unlock_enabled,
+                                                            rep.digest_matches
+                                                        ));
+                                                        self.frp_report = Some(rep);
+                                                    }
+                                                    Err(e) => {
+                                                        self.log_messages.push(format!(
+                                                            "[ERROR] Failed to inspect FRP partition: {}",
+                                                            e
+                                                        ));
+                                                    }
+                                                }
+                                    }
+
+                                    ui.small(
+                                        "FRP images are inspected read-only. OEM unlock state must be changed on the device through its supported settings flow.",
+                                    );
+                                });
+
+                                if let Some(ref rep) = self.frp_report {
+                                    ui.small(format!(
+                                        "✔ Inspected FRP Block ({} bytes) | Marker: 0x{:08X} | Enrolled Credentials: {} | OEM Unlock Byte: {} | SHA-256 Digest Verified: {}",
+                                        rep.partition_size_bytes,
+                                        rep.header_marker,
+                                        rep.has_enrolled_credentials,
+                                        rep.oem_unlock_enabled,
+                                        rep.digest_matches
+                                    ));
+                                }
+                            });
+
+                            ui.add_space(8.0);
+
+                            if self.flash_target_type != FlashTargetType::SamsungOdinLoke {
+                                // Target Hardware Profile
+                                ui.group(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.heading("🛠 Hardware Profile & Preset");
                                     if let Some(detected) = self.auto_detected_profile {
@@ -751,12 +1391,12 @@ impl eframe::App for FlashrustApp {
                                 }
 
                                 ui.label(format!("Architecture: NXP {} (Cortex-A53 / A55)", self.current_preset().soc));
-                            });
+                                });
 
-                            ui.add_space(8.0);
+                                ui.add_space(8.0);
 
-                            // Section 2: Target Binary & Folder Overrides (Native File Picker)
-                            ui.group(|ui| {
+                                // Section 2: Target Binary & Folder Overrides (Native File Picker)
+                                ui.group(|ui| {
                                 ui.label(egui::RichText::new("Target Binary & Folder Overrides").strong());
                                 ui.separator();
 
@@ -774,10 +1414,10 @@ impl eframe::App for FlashrustApp {
                                             .map(|p| p.to_string_lossy().to_string())
                                             .unwrap_or_else(|| "Default Build Output Path".to_string());
                                         ui.add_enabled(false, egui::TextEdit::singleline(&mut dir_str.clone()).desired_width(180.0));
-                                        if ui.button("📂 Browse Folder").clicked() {
-                                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                        if ui.button("📂 Browse Folder").clicked()
+                                            && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                                        {
                                                 self.uuu_builder.image_dir = Some(folder);
-                                            }
                                         }
                                         ui.end_row();
 
@@ -790,17 +1430,16 @@ impl eframe::App for FlashrustApp {
                                             .map(|p| p.to_string_lossy().to_string())
                                             .unwrap_or_else(|| format!("{}.img (Standard)", self.flash_partition_name));
                                         ui.add_enabled(false, egui::TextEdit::singleline(&mut kernel_str.clone()).desired_width(180.0));
-                                        if ui.button("📂 Select File").clicked() {
-                                            if let Some(file) = rfd::FileDialog::new()
+                                        if ui.button("📂 Select File").clicked()
+                                            && let Some(file) = rfd::FileDialog::new()
                                                 .add_filter("Boot Images (*.img, *.bin)", &["img", "bin"])
                                                 .pick_file()
-                                            {
+                                        {
                                                 self.patch_settings.custom_kernel_img = Some(file.clone());
                                                 let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
                                                 if ["boot", "init_boot", "recovery", "vendor_boot", "system", "super", "vbmeta"].contains(&stem.as_str()) {
                                                     self.flash_partition_name = stem;
                                                 }
-                                            }
                                         }
                                         ui.end_row();
 
@@ -810,13 +1449,12 @@ impl eframe::App for FlashrustApp {
                                         if ui.add(egui::TextEdit::singleline(&mut uboot_str).desired_width(180.0)).changed() {
                                             self.uuu_builder.uboot_feature = if uboot_str.is_empty() { None } else { Some(uboot_str) };
                                         }
-                                        if ui.button("📂 Browse U-Boot").clicked() {
-                                            if let Some(file) = rfd::FileDialog::new()
+                                        if ui.button("📂 Browse U-Boot").clicked()
+                                            && let Some(file) = rfd::FileDialog::new()
                                                 .add_filter("U-Boot / SPL (*.bin, *.imx, *.itb)", &["bin", "imx", "itb"])
                                                 .pick_file()
-                                            {
+                                        {
                                                 self.uuu_builder.uboot_feature = Some(file.to_string_lossy().to_string());
-                                            }
                                         }
                                         ui.end_row();
 
@@ -826,43 +1464,33 @@ impl eframe::App for FlashrustApp {
                                         if ui.add(egui::TextEdit::singleline(&mut dtb_str).desired_width(180.0)).changed() {
                                             self.uuu_builder.dtb_feature = if dtb_str.is_empty() { None } else { Some(dtb_str) };
                                         }
-                                        if ui.button("📂 Browse DTB").clicked() {
-                                            if let Some(file) = rfd::FileDialog::new()
+                                        if ui.button("📂 Browse DTB").clicked()
+                                            && let Some(file) = rfd::FileDialog::new()
                                                 .add_filter("Device Tree Overlays (*.dtbo, *.dtb)", &["dtbo", "dtb"])
                                                 .pick_file()
-                                            {
+                                        {
                                                 self.uuu_builder.dtb_feature = Some(file.to_string_lossy().to_string());
-                                            }
                                         }
                                         ui.end_row();
                                     });
-                            });
+                                });
+                            }
 
                             ui.add_space(8.0);
 
-                            // Section 3: In-Memory Boot Kitchen & Auto SU Injection
+                            // Section 3: Implemented offline boot-image patching
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("In-Memory Boot Kitchen & Root Engine (Zig)").strong());
-                                    if self.patch_settings.auto_su_inject {
-                                        ui.colored_label(egui::Color32::from_rgb(0, 255, 128), "⚡ SU INJECTION ACTIVE");
-                                    }
+                                    ui.label(
+                                        egui::RichText::new("Offline ADB Boot Image Patcher")
+                                            .strong(),
+                                    );
                                 });
                                 ui.separator();
 
-                                ui.horizontal(|ui| {
-                                    let is_auto_su = self.patch_settings.auto_su_inject;
-                                    ui.checkbox(
-                                        &mut self.patch_settings.auto_su_inject,
-                                        egui::RichText::new("⚡ Auto SU Binary Injection (Root Access)").strong().color(
-                                            if is_auto_su {
-                                                egui::Color32::from_rgb(0, 255, 180)
-                                            } else {
-                                                egui::Color32::WHITE
-                                            },
-                                        ),
-                                    );
-                                });
+                                self.patch_settings.auto_su_inject = false;
+                                self.patch_settings.permissive_selinux = false;
+                                self.patch_settings.resign_avb = false;
 
                                 if self.patch_settings.auto_su_inject {
                                     ui.add_space(4.0);
@@ -1021,13 +1649,12 @@ impl eframe::App for FlashrustApp {
                                                     .map(|p| p.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| "Embedded Universal SU Supervisor (ARM64/x86_64)".to_string());
                                                 ui.add_enabled(false, egui::TextEdit::singleline(&mut su_bin_str.clone()).desired_width(200.0));
-                                                if ui.button("📂 Select SU Binary").clicked() {
-                                                    if let Some(file) = rfd::FileDialog::new()
+                                                if ui.button("📂 Select SU Binary").clicked()
+                                                    && let Some(file) = rfd::FileDialog::new()
                                                         .add_filter("Executable Binaries", &["bin", "elf", "so", "*"])
                                                         .pick_file()
-                                                    {
+                                                {
                                                         self.patch_settings.su_custom_binary = Some(file);
-                                                    }
                                                 }
                                                 if self.patch_settings.su_custom_binary.is_some() && ui.button("✖ Reset").clicked() {
                                                     self.patch_settings.su_custom_binary = None;
@@ -1039,20 +1666,141 @@ impl eframe::App for FlashrustApp {
                                 ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.checkbox(
-                                        &mut self.patch_settings.permissive_selinux,
-                                        "🛡 Inject Permissive SELinux Rules (allow su * * *)",
-                                    );
-                                    ui.checkbox(
-                                        &mut self.patch_settings.resign_avb,
-                                        "🔑 Re-sign AVB Metadata (vbmeta.img)",
+                                        &mut self.patch_settings.adb_preauth,
+                                        "⚡ Export boot image with ADB preauthorization",
                                     );
                                 });
+
+                                if self.patch_settings.adb_preauth {
+                                    ui.add_space(6.0);
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_rgb(15, 24, 32))
+                                        .inner_margin(8.0)
+                                        .corner_radius(4.0)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("Offline ADB Boot Image Export")
+                                                    .strong(),
+                                            );
+                                            ui.small(
+                                                "The exported image is custom firmware and requires an unlocked bootloader. This action does not flash the phone.",
+                                            );
+
+                                            ui.horizontal(|ui| {
+                                                ui.label("Boot image:");
+                                                ui.label(
+                                                    self.boot_image_path
+                                                        .as_ref()
+                                                        .map(|path| path.display().to_string())
+                                                        .unwrap_or_else(|| "Not selected".into()),
+                                                );
+                                                if ui.button("📂 Select boot.img").clicked()
+                                                    && let Some(path) = rfd::FileDialog::new()
+                                                        .add_filter(
+                                                            "Android Boot Images",
+                                                            &["img", "bin"],
+                                                        )
+                                                        .pick_file()
+                                                {
+                                                    self.boot_image_path = Some(path);
+                                                    self.boot_patch_status = None;
+                                                }
+                                            });
+
+                                            ui.horizontal(|ui| {
+                                                ui.label("ADB public key:");
+                                                ui.label(
+                                                    self.adb_public_key_path
+                                                        .as_ref()
+                                                        .map(|path| path.display().to_string())
+                                                        .unwrap_or_else(|| "Not selected".into()),
+                                                );
+                                                if ui.button("📂 Select adbkey.pub").clicked()
+                                                    && let Some(path) = rfd::FileDialog::new()
+                                                        .add_filter("Android ADB Public Key", &["pub"])
+                                                        .pick_file()
+                                                {
+                                                    self.adb_public_key_path = Some(path);
+                                                    self.boot_patch_status = None;
+                                                }
+                                            });
+
+                                            ui.checkbox(
+                                                &mut self.custom_image_confirmed,
+                                                "I confirm this device is mine and its bootloader accepts custom images",
+                                            );
+
+                                            let preflight_allowed = self.flash_target_type
+                                                != FlashTargetType::SamsungOdinLoke
+                                                || self
+                                                    .samsung_config
+                                                    .evaluate_preflight(true)
+                                                    .current_payload_allowed;
+                                            let export_ready = self.boot_image_path.is_some()
+                                                && self.adb_public_key_path.is_some()
+                                                && self.custom_image_confirmed
+                                                && preflight_allowed
+                                                && !self.boot_patch_active;
+                                            let export_button = ui.add_enabled(
+                                                export_ready,
+                                                egui::Button::new(
+                                                    "💾 Patch and Export Custom Boot Image",
+                                                ),
+                                            );
+                                            if export_button.clicked() {
+                                                let default_name = self
+                                                    .boot_image_path
+                                                    .as_ref()
+                                                    .and_then(|path| path.file_stem())
+                                                    .map(|stem| {
+                                                        format!(
+                                                            "{}-adb.img",
+                                                            stem.to_string_lossy()
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| "boot-adb.img".into());
+                                                if let Some(output) = rfd::FileDialog::new()
+                                                    .set_file_name(&default_name)
+                                                    .save_file()
+                                                {
+                                                    self.trigger_adb_patch_export(output);
+                                                }
+                                            }
+                                            if !preflight_allowed {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(255, 120, 100),
+                                                    "Samsung custom-image preflight is blocked by the selected FRP, OEM unlock, or KG state.",
+                                                );
+                                            }
+                                            if self.boot_patch_active {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label("Patching image…");
+                                                });
+                                            }
+                                            if let Some(status) = &self.boot_patch_status {
+                                                ui.label(status);
+                                            }
+                                        });
+                                }
                             });
 
                             ui.add_space(8.0);
 
                             // Section 4: Target Configuration & Execution Flags
-                            ui.group(|ui| {
+                            if self.flash_target_type == FlashTargetType::SamsungOdinLoke {
+                                ui.group(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Samsung Flash Options").strong(),
+                                    );
+                                    ui.separator();
+                                    ui.checkbox(
+                                        &mut self.auto_reboot_after_flash,
+                                        "Reboot device after successful flash",
+                                    );
+                                });
+                            } else {
+                                ui.group(|ui| {
                                 ui.label(egui::RichText::new("Target Configuration & Hardware Flags").strong());
                                 ui.separator();
 
@@ -1121,7 +1869,8 @@ impl eframe::App for FlashrustApp {
                                     ui.checkbox(&mut self.uuu_builder.dry_run, "Dry Run Preview (-dryrun)");
                                     ui.checkbox(&mut self.auto_reboot_after_flash, "Auto-reboot Device After Flash");
                                 });
-                            });
+                                });
+                            }
 
                             ui.add_space(8.0);
 
@@ -1148,12 +1897,30 @@ impl eframe::App for FlashrustApp {
                             ui.group(|ui| {
                                 ui.vertical_centered(|ui| {
                                     let btn_text = if self.flashing_active {
-                                        "⚡ FLASHING IN PROGRESS..."
+                                        "⚡ WORKING..."
+                                    } else if self.flash_target_type == FlashTargetType::SamsungOdinLoke {
+                                        "⚡ FLASH SAMSUNG VIA HEIMDALL"
                                     } else {
                                         "🚀 EXECUTE FLASH PIPELINE"
                                     };
 
-                                    let can_execute = !self.flashing_active && self.selected_device().is_some();
+                                    let samsung_ready = self.flash_target_type
+                                        == FlashTargetType::SamsungOdinLoke
+                                        && self.samsung_flash_confirmed
+                                        && HeimdallEngine::find_executable().is_some()
+                                        && [
+                                            self.samsung_config.bl_tar.as_ref(),
+                                            self.samsung_config.ap_tar.as_ref(),
+                                            self.samsung_config.cp_tar.as_ref(),
+                                            self.samsung_config.csc_tar.as_ref(),
+                                        ]
+                                        .iter()
+                                        .any(|path| path.is_some());
+                                    let can_execute = !self.flashing_active
+                                        && (samsung_ready
+                                            || (self.flash_target_type
+                                                != FlashTargetType::SamsungOdinLoke
+                                                && self.selected_device().is_some()));
                                     if ui
                                         .add_enabled(
                                             can_execute,
@@ -1255,6 +2022,7 @@ impl eframe::App for FlashrustApp {
                                         ui.push_id(idx, |ui| {
                                             let is_selected = self.selected_device_idx == Some(idx);
                                             let mode_color = match dev.operating_mode {
+                                                DeviceOperatingMode::SamsungLokeDownload => egui::Color32::from_rgb(0, 230, 255),
                                                 DeviceOperatingMode::NxpSerialDownload => egui::Color32::from_rgb(255, 165, 0),
                                                 DeviceOperatingMode::Fastboot => egui::Color32::from_rgb(0, 255, 128),
                                                 DeviceOperatingMode::AndroidAdb => egui::Color32::from_rgb(0, 210, 255),
