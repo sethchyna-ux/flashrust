@@ -50,8 +50,9 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 820.0])
-            .with_min_inner_size([960.0, 660.0])
+            .with_inner_size([1650.0, 1050.0])
+            .with_min_inner_size([1400.0, 900.0])
+            .with_resizable(true)
             .with_title("Project flashrust | Samsung Firmware Inspector & Offline Boot Patcher"),
         ..Default::default()
     };
@@ -1013,45 +1014,59 @@ impl eframe::App for FlashrustApp {
                                 ui.separator();
 
                                 // Bootloader Lock Status Bar (FRP LOCK / KG STATE / OEM UNLOCK)
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new("Download Mode State:").strong());
-                                    if ui
-                                        .selectable_label(
-                                            self.samsung_config.frp_lock_state == FrpLockState::On,
-                                            "🔒 FRP LOCK: ON",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.samsung_config.frp_lock_state = FrpLockState::On;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            self.samsung_config.frp_lock_state == FrpLockState::Off,
-                                            "🔓 FRP LOCK: OFF",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.samsung_config.frp_lock_state = FrpLockState::Off;
-                                    }
+                                egui::Grid::new("samsung_lock_grid")
+                                    .num_columns(4)
+                                    .spacing([20.0, 8.0])
+                                    .striped(false)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Download Mode State:").strong(),
+                                        );
+                                        ui.end_row();
 
-                                    ui.checkbox(
-                                        &mut self.samsung_config.oem_unlock_enabled,
-                                        "OEM UNLOCK: ENABLED",
-                                    );
+                                        ui.label("FRP Lock:");
+                                        if ui
+                                            .selectable_label(
+                                                self.samsung_config.frp_lock_state
+                                                    == FrpLockState::On,
+                                                "🔒 ON",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.samsung_config.frp_lock_state =
+                                                FrpLockState::On;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.samsung_config.frp_lock_state
+                                                    == FrpLockState::Off,
+                                                "🔓 OFF",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.samsung_config.frp_lock_state =
+                                                FrpLockState::Off;
+                                        }
+                                        ui.checkbox(
+                                            &mut self.samsung_config.oem_unlock_enabled,
+                                            "OEM UNLOCK: ENABLED",
+                                        );
+                                        ui.end_row();
 
-                                    ui.separator();
-                                    egui::ComboBox::from_id_salt("kg_state_combo")
-                                        .selected_text(self.samsung_config.kg_lock_state.label())
-                                        .show_ui(ui, |ui| {
-                                            for kg in KgLockState::ALL {
-                                                ui.selectable_value(
-                                                    &mut self.samsung_config.kg_lock_state,
-                                                    kg,
-                                                    kg.label(),
-                                                );
-                                            }
-                                        });
-                                });
+                                        ui.label("KG State:");
+                                        egui::ComboBox::from_id_salt("kg_state_combo")
+                                            .selected_text(self.samsung_config.kg_lock_state.label())
+                                            .show_ui(ui, |ui| {
+                                                for kg in KgLockState::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.samsung_config.kg_lock_state,
+                                                        kg,
+                                                        kg.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.end_row();
+                                    });
 
                                 // Live Preflight Diagnostic Box
                                 ui.add_space(4.0);
@@ -1114,54 +1129,74 @@ impl eframe::App for FlashrustApp {
 
                                 // Real Download Mode detection and reboot controls
                                 ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Download Mode USB Control:")
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(255, 200, 90)),
-                                    );
-                                    if ui
-                                        .button("🔍 Detect with Heimdall USB")
-                                        .clicked()
-                                    {
-                                        match HeimdallEngine::detect() {
-                                            Ok(output) => self.log_messages.push(format!(
-                                                "[HEIMDALL-DETECT] {output}"
-                                            )),
-                                            Err(error) => self.log_messages.push(format!(
-                                                "[HEIMDALL-DETECT-ERROR] {error}"
-                                            )),
-                                        }
-                                    }
+                                egui::Grid::new("samsung_usb_control_grid")
+                                    .num_columns(3)
+                                    .spacing([16.0, 10.0])
+                                    .striped(false)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Download Mode USB Control:")
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(255, 200, 90)),
+                                        );
+                                        ui.end_row();
 
-                                    if ui
-                                        .button(
-                                            egui::RichText::new(
-                                                "🔄 Reboot to Real Download Mode (AT+FUS? / ADB)",
+                                        if ui
+                                            .button("🔍 Detect with Heimdall USB")
+                                            .clicked()
+                                        {
+                                            match HeimdallEngine::detect() {
+                                                Ok(output) => self.log_messages.push(format!(
+                                                    "[HEIMDALL-DETECT] {output}"
+                                                )),
+                                                Err(error) => self.log_messages.push(format!(
+                                                    "[HEIMDALL-DETECT-ERROR] {error}"
+                                                )),
+                                            }
+                                        }
+                                        ui.end_row();
+
+                                        if ui
+                                            .button(
+                                                egui::RichText::new(
+                                                    "🔄 Reboot to Real Download Mode",
+                                                )
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(0, 255, 160)),
                                             )
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(0, 255, 160)),
-                                        )
-                                        .clicked()
-                                    {
-                                        let logs = OdinProtocolEngine::reboot_to_download_mode();
-                                        for line in logs {
-                                            self.log_messages.push(format!("[ODIN-REBOOT] {}", line));
+                                            .clicked()
+                                        {
+                                            let logs = OdinProtocolEngine::reboot_to_download_mode();
+                                            for line in logs {
+                                                self.log_messages.push(format!(
+                                                    "[ODIN-REBOOT] {}",
+                                                    line
+                                                ));
+                                            }
+                                            let rep =
+                                                OdinProtocolEngine::probe_samsung_download_mode();
+                                            self.samsung_mode_report = Some(rep);
                                         }
-                                        let rep = OdinProtocolEngine::probe_samsung_download_mode();
-                                        self.samsung_mode_report = Some(rep);
-                                    }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "(AT+FUS? / ADB / fastboot reboot download)",
+                                            )
+                                            .small()
+                                            .color(egui::Color32::from_rgb(150, 150, 150)),
+                                        );
+                                        ui.end_row();
 
-                                    if ui
-                                        .button("🔁 Loke Reboot Device (0x67 EndSession)")
-                                        .clicked()
-                                    {
-                                        let logs = OdinProtocolEngine::loke_reboot_device();
-                                        for line in logs {
-                                            self.log_messages.push(line);
+                                        if ui
+                                            .button("🔁 Loke Reboot Device (0x67 EndSession)")
+                                            .clicked()
+                                        {
+                                            let logs = OdinProtocolEngine::loke_reboot_device();
+                                            for line in logs {
+                                                self.log_messages.push(line);
+                                            }
                                         }
-                                    }
-                                });
+                                        ui.end_row();
+                                    });
 
                                 if let Some(ref mode_rep) = self.samsung_mode_report {
                                     let mode_color = match mode_rep.detected_submode {
@@ -2118,7 +2153,6 @@ impl eframe::App for FlashrustApp {
                             let mut new_selection = None;
                             egui::ScrollArea::vertical()
                                 .id_salt("usb_devices_scroll_area")
-                                .max_height(140.0)
                                 .show(ui, |ui| {
                                     for (idx, dev) in self.devices.iter().enumerate() {
                                         ui.push_id(idx, |ui| {
@@ -2193,7 +2227,6 @@ impl eframe::App for FlashrustApp {
 
                         egui::ScrollArea::vertical()
                             .id_salt("target_event_log_scroll_area")
-                            .max_height(140.0)
                             .show(ui, |ui| {
                                 for (log_idx, msg) in self.log_messages.iter().rev().enumerate() {
                                     ui.push_id(log_idx, |ui| {
